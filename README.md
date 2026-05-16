@@ -17,6 +17,13 @@
 - One-click start/stop with custom stream titles
 - Admin can **force-end streams** instantly
 
+> ⚠️ **HTTPS Required for Live Streaming**
+> Your browser blocks camera/microphone on HTTP (except localhost). Please:
+> - Access via `https://` (recommended)
+> - Or use `http://localhost:5000` only
+>
+> Need HTTPS for local development? Use our companion tool [**http2https**](https://github.com/giriaryan694-a11y/http2https) to wrap your HTTP service with a local HTTPS reverse proxy and auto-generated TLS certificates.
+
 ### 🔔 Social Features
 - **Subscribe** to family members and get notified of new uploads
 - **Comments & Replies** with @mentions and like system
@@ -65,7 +72,7 @@
 
 ```bash
 # 1. Clone or download the project
-git clone <https://github.com/giriaryan694-a11y/FamTube
+git clone https://github.com/giriaryan694-a11y/FamTube
 cd FamTube
 
 # 2. Create virtual environment (recommended)
@@ -93,6 +100,55 @@ Password: <random-12-char-password>
 ```
 
 **Log in immediately and change the admin password** via Settings → Credentials.
+
+---
+
+## 🔐 Enabling HTTPS for Live Streaming (WebRTC)
+
+Browsers require a secure context (`https://` or `localhost`) to access camera and microphone for WebRTC live streaming.
+
+### Option 1: Use http2https (Recommended for Local/Dev)
+
+[**http2https**](https://github.com/giriaryan694-a11y/http2https) is a lightweight Python CLI tool that wraps your HTTP-only FamTube instance with HTTPS using auto-generated TLS certificates.
+
+**Setup:**
+
+```bash
+# 1. Install http2https
+git clone https://github.com/giriaryan694-a11y/http2https
+cd http2https
+pip install cryptography pyfiglet termcolor colorama requests
+
+# 2. Start FamTube on its default port
+#    (from the FamTube directory)
+python main.py
+
+# 3. In a new terminal, run http2https
+python http2https.py
+#    - Certificate Title: FamTubeDevCA
+#    - Domains / IPs: localhost, 127.0.0.1
+#    - Internal Port: 5000
+#    - HTTPS Port: 8443
+
+# 4. Open https://localhost:8443 in your browser
+#    Trust the certificate when prompted for first use
+```
+
+> 📖 See the [http2https README](https://github.com/giriaryan694-a11y/http2https#trusting-the-certificate) for detailed certificate-trust instructions per OS.
+
+### Option 2: Use localhost directly
+
+If running FamTube on the same machine you are streaming from, simply open:
+
+```
+http://localhost:5000
+```
+
+`localhost` is treated as a secure context by browsers, so camera/microphone access is allowed without HTTPS.
+
+### Option 3: Production HTTPS (Reverse Proxy)
+
+For production or network access, place FamTube behind a reverse proxy (Nginx, Caddy, Traefik) with valid TLS certificates.
 
 ---
 
@@ -132,7 +188,7 @@ famtube_admin/
 2. **Upload** videos from the navbar (+ Upload button)
 3. **Explore** videos by hashtag on the Explore page
 4. **Subscribe** to family members to see their uploads in your feed
-5. **Go Live** to start a real-time video stream
+5. **Go Live** to start a real-time video stream *(requires HTTPS or localhost)*
 6. **Save videos** and organize them into **Playlists**
 7. **Check History** to revisit previously watched videos
 
@@ -166,6 +222,7 @@ famtube_admin/
 - **Set `FAMTUBE_SECRET_KEY`** to a fixed value in production to prevent session invalidation on restart
 - **IP Filtering** is disabled by default — enable it from the Admin Dashboard when needed
 - All file uploads are validated by **magic bytes**, not just extensions
+- For local WebRTC testing, use `http2https` or `localhost` to satisfy browser secure-context requirements
 
 ---
 
