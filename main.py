@@ -184,7 +184,7 @@ def security_checks():
     # Skip static files and login page
     if request.endpoint in ('static', 'login', None):
         return
-    
+
     # Enforce IP filtering
     try:
         config = load_json(CONFIG_FILE)
@@ -193,7 +193,7 @@ def security_checks():
             blocked = config.get('blocked_ips', [])
             allowed = config.get('allowed_ips', [])
             strict = config.get('strict_allowlist_mode', False)
-            
+
             if client_ip in blocked:
                 abort(403)
             if strict and client_ip not in allowed:
@@ -201,25 +201,31 @@ def security_checks():
     except Exception:
         pass
 
+@app.after_request
+def add_permissions_policy(response):
+    """Allow camera and microphone access for WebRTC live streaming."""
+    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(self)'
+    return response
+
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'session_id' not in session or 'username' not in session:
             session.clear()
             return redirect(url_for('login'))
-        
+
         # CRITICAL FIX: Verify user still exists in database
         users = load_json(USERS_FILE)
         if not is_valid_username(session['username']) or session['username'] not in users:
             session.clear()
             return redirect(url_for('login'))
-        
+
         # Verify session is still valid in sessions file
         sessions = load_json(SESSIONS_FILE)
         if session['session_id'] not in sessions:
             session.clear()
             return redirect(url_for('login'))
-        
+
         return f(*args, **kwargs)
     return decorated_function
 
@@ -284,42 +290,43 @@ def update_user_data(username, data):
 # ==================== ROUTES ====================
 
 @app.route('/')
+@login_required
 def index():
     videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
     current_user = session.get('username')
     role = session.get('role')
-    
+
     feed_videos = []
     subscribed_content = []
     subs = load_json(SUBS_FILE).get(current_user, []) if current_user else []
-    
+
     for vid, v in videos.items():
         if not can_view_video(v, current_user, role):
             continue
         v['id'] = vid
         uploader_data = users.get(v['uploader'], {})
         v['uploader_pic'] = uploader_data.get('profile_pic', '')
-        
+
         if current_user and v['uploader'] in subs:
             subscribed_content.append(v)
         else:
             feed_videos.append(v)
-    
+
     feed_videos.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     subscribed_content.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    
+
     live_data = {}
     for u, meta in live_streams.items():
         live_data[u] = meta
-    
+
     unread = 0
     current_user_obj = {}
     if current_user:
         notifs = load_json(NOTIFS_FILE).get(current_user, [])
         unread = sum(1 for n in notifs if not n.get('read'))
         current_user_obj = users.get(current_user, {})
-    
+
     return render_template('index.html', 
                          videos=feed_videos[:50], 
                          subscribed_content=subscribed_content[:20],
@@ -335,24 +342,24 @@ def login():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
         remember = request.form.get('remember')
-        
+
         if not is_valid_username(username):
             error_msg = "Invalid username format."
             log_activity('failed_login_invalid_format', username or 'Guest')
             return render_template('login.html', error_msg=error_msg)
-        
+
         users = load_json(USERS_FILE)
         user_data = users.get(username)
-        
+
         if user_data and check_password_hash(user_data['password_hash'], password):
             session.clear()
             session['username'] = username
             session['role'] = user_data.get('role', 'user')
             session['session_id'] = str(uuid.uuid4())
-            
+
             if remember:
                 session.permanent = True
-            
+
             sessions = load_json(SESSIONS_FILE)
             sessions[session['session_id']] = {
                 'username': username,
@@ -361,13 +368,13 @@ def login():
                 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             save_json(SESSIONS_FILE, sessions)
-            
+
             log_activity('login', username)
             return redirect(url_for('index'))
         else:
             error_msg = "Invalid username or password."
             log_activity('failed_login', username or 'Guest')
-    
+
     return render_template('login.html', error_msg=error_msg)
 
 @app.route('/logout')
@@ -385,36 +392,36 @@ def explore():
     users = load_json(USERS_FILE)
     current_user = session.get('username')
     role = session.get('role')
-    
+
     hashtags = get_all_hashtags()
     tags_param = request.args.get('tags', '').strip()
     selected_tags = [t.strip().lower() for t in tags_param.split(',') if t.strip()] if tags_param else []
-    
+
     filtered = []
     for vid, v in videos.items():
         if not can_view_video(v, current_user, role):
             continue
-        
+
         v['id'] = vid
         uploader_data = users.get(v['uploader'], {})
         v['uploader_pic'] = uploader_data.get('profile_pic', '')
-        
+
         if selected_tags:
             vid_tags = v.get('hashtags', '').lower()
             if any('#'+tag in vid_tags or tag in vid_tags for tag in selected_tags):
                 filtered.append(v)
         else:
             filtered.append(v)
-    
+
     filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    
+
     unread = 0
     current_user_obj = {}
     if current_user:
         notifs = load_json(NOTIFS_FILE).get(current_user, [])
         unread = sum(1 for n in notifs if not n.get('read'))
         current_user_obj = users.get(current_user, {})
-    
+
     return render_template('explore.html',
                          videos=filtered,
                          hashtags=hashtags,
@@ -430,15 +437,15 @@ def search():
     role = session.get('role')
     users = load_json(USERS_FILE)
     videos = load_json(VIDEOS_FILE)
-    
+
     result_users = []
     result_videos = []
-    
+
     if query:
         for u, data in users.items():
             if query.lower() in u.lower():
                 result_users.append(u)
-        
+
         for vid, v in videos.items():
             if not can_view_video(v, current_user, role):
                 continue
@@ -447,14 +454,14 @@ def search():
                 uploader_data = users.get(v['uploader'], {})
                 v['uploader_pic'] = uploader_data.get('profile_pic', '')
                 result_videos.append(v)
-    
+
     unread = 0
     current_user_obj = {}
     if current_user:
         notifs = load_json(NOTIFS_FILE).get(current_user, [])
         unread = sum(1 for n in notifs if not n.get('read'))
         current_user_obj = users.get(current_user, {})
-    
+
     return render_template('search.html',
                          query=query,
                          users=result_users,
@@ -469,17 +476,17 @@ def upload():
     if request.method == 'POST':
         if 'video_file' not in request.files:
             return redirect(url_for('upload'))
-        
+
         file = request.files['video_file']
         if file.filename == '':
             return redirect(url_for('upload'))
-        
+
         if file and allowed_file(file.filename, ALLOWED_EXTENSIONS):
             filename = secure_filename(file.filename)
             unique_name = f"{uuid.uuid4().hex}_{filename}"
             filepath = os.path.join(VIDEO_DIR, unique_name)
             file.save(filepath)
-            
+
             # SECURITY FIX: Validate actual file content
             if not validate_file_content(filepath, 'video'):
                 os.remove(filepath)
@@ -489,13 +496,13 @@ def upload():
                                      error_msg="Invalid video file content.",
                                      unread_notifs=unread,
                                      current_user_obj=users.get(session['username'], {}))
-            
+
             title = request.form.get('title', 'Untitled').strip()
             captions = request.form.get('captions', '').strip()
             hashtags = request.form.get('hashtags', '').strip()
             privacy = request.form.get('privacy', 'public')
             allowed_users = request.form.get('allowed_users', '').strip()
-            
+
             videos = load_json(VIDEOS_FILE)
             video_id = str(uuid.uuid4())
             videos[video_id] = {
@@ -510,20 +517,20 @@ def upload():
                 'visibility': 'visible'
             }
             save_json(VIDEOS_FILE, videos)
-            
+
             subs = load_json(SUBS_FILE)
             for subscriber, sub_list in subs.items():
                 if session['username'] in sub_list:
                     notify_user(subscriber, f"{session['username']} uploaded: {title}", f"/watch/{video_id}", sender=session['username'])
-            
+
             log_activity('upload', session['username'])
             return redirect(url_for('watch', video_id=video_id))
-    
+
     users = load_json(USERS_FILE)
     current_user_obj = users.get(session.get('username'), {})
     notifs = load_json(NOTIFS_FILE).get(session.get('username'), [])
     unread = sum(1 for n in notifs if not n.get('read'))
-    
+
     return render_template('upload.html', 
                          unread_notifs=unread,
                          current_user_obj=current_user_obj,
@@ -537,14 +544,14 @@ def watch(video_id):
     comments_db = load_json(COMMENTS_FILE)
     saved_db = load_json(SAVED_FILE)
     playlists_db = load_json(PLAYLISTS_FILE)
-    
+
     video = videos.get(video_id)
     if not video:
         abort(404)
-    
+
     if not can_view_video(video, session.get('username'), session.get('role')):
         abort(403)
-    
+
     if request.method == 'POST':
         text = request.form.get('comment_text', '').strip()
         parent_id = request.form.get('parent_id', '').strip()
@@ -558,10 +565,10 @@ def watch(video_id):
                 'likes': [],
                 'user_pic': users.get(session['username'], {}).get('profile_pic', '')
             }
-            
+
             if video_id not in comments_db:
                 comments_db[video_id] = []
-            
+
             if parent_id:
                 for c in comments_db.get(video_id, []):
                     if c['id'] == parent_id:
@@ -576,7 +583,7 @@ def watch(video_id):
                             'user_pic': users.get(session['username'], {}).get('profile_pic', '')
                         }
                         c['replies'].append(reply_obj)
-                        
+
                         if c['user'] != session['username']:
                             notify_user(c['user'], f"{session['username']} replied to your comment", f"/watch/{video_id}", sender=session['username'])
                         break
@@ -584,20 +591,20 @@ def watch(video_id):
                 comments_db[video_id].append(comment_obj)
                 if video['uploader'] != session['username']:
                     notify_user(video['uploader'], f"{session['username']} commented on your video", f"/watch/{video_id}", sender=session['username'])
-            
+
             save_json(COMMENTS_FILE, comments_db)
             return redirect(url_for('watch', video_id=video_id))
-    
+
     comments = comments_db.get(video_id, [])
     user_saved = saved_db.get(session['username'], [])
     is_saved = video_id in user_saved
     uploader_pic = users.get(video['uploader'], {}).get('profile_pic', '')
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(session.get('username'), [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(session.get('username'), {})
-    
+
     return render_template('watch.html',
                          video=video,
                          video_id=video_id,
@@ -612,16 +619,16 @@ def watch(video_id):
 def user_profile(username):
     if not is_valid_username(username):
         abort(404)
-    
+
     users = load_json(USERS_FILE)
     videos = load_json(VIDEOS_FILE)
     subs = load_json(SUBS_FILE)
     playlists = load_json(PLAYLISTS_FILE)
-    
+
     profile = users.get(username)
     if not profile:
         abort(404)
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
         target = request.form.get('target_user')
@@ -636,30 +643,30 @@ def user_profile(username):
             subs[current] = user_subs
             save_json(SUBS_FILE, subs)
             return redirect(url_for('user_profile', username=username))
-    
+
     user_videos = []
     for vid, v in videos.items():
         if v['uploader'] == username:
             if can_view_video(v, session.get('username'), session.get('role')):
                 v['id'] = vid
                 user_videos.append(v)
-    
+
     user_videos.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     is_subscribed = username in subs.get(session['username'], [])
-    
+
     user_playlists = []
     for pl_id, pl in playlists.items():
         if pl.get('owner') == username:
             pl['id'] = pl_id
             pl['video_count'] = len(pl.get('videos', []))
             user_playlists.append(pl)
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(session['username'], [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(session['username'], {})
     is_online = username in online_users
-    
+
     return render_template('profile.html',
                          profile_name=username,
                          profile_pic=profile.get('profile_pic', ''),
@@ -679,18 +686,18 @@ def settings():
     users = load_json(USERS_FILE)
     username = session['username']
     user_data = users.get(username, {})
-    
+
     success_msg = None
     error_msg = None
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
-        
+
         if action == 'update_profile':
             bio = request.form.get('bio', '').strip()
             if bio:
                 user_data['bio'] = bio[:500]  # Limit bio length
-            
+
             if 'profile_pic' in request.files:
                 file = request.files['profile_pic']
                 if file and file.filename and allowed_file(file.filename, ALLOWED_PICS):
@@ -698,35 +705,35 @@ def settings():
                     unique_name = f"{uuid.uuid4().hex}_{filename}"
                     filepath = os.path.join(PROFILE_DIR, unique_name)
                     file.save(filepath)
-                    
+
                     # Validate image content
                     if validate_file_content(filepath, 'image'):
                         user_data['profile_pic'] = unique_name
                     else:
                         os.remove(filepath)
                         error_msg = "Invalid image file."
-            
+
             if not error_msg:
                 update_user_data(username, user_data)
                 success_msg = "Profile updated successfully!"
                 log_activity('update_profile', username)
-        
+
         elif action == 'toggle_privacy':
             hide = request.form.get('hide_last_seen') == 'yes'
             user_data['hide_last_seen'] = hide
             update_user_data(username, user_data)
             success_msg = "Privacy settings saved."
-        
+
         elif action == 'toggle_device_notif':
             enabled = request.form.get('device_notif') == 'yes'
             user_data['device_notif_enabled'] = enabled
             update_user_data(username, user_data)
             success_msg = "Notification settings saved."
-        
+
         elif action == 'change_creds':
             new_username = request.form.get('new_username', '').strip()
             new_password = request.form.get('new_password', '')
-            
+
             if new_username and new_username != username:
                 if not is_valid_username(new_username):
                     error_msg = "Username must be 3-30 characters, alphanumeric and underscores only."
@@ -739,7 +746,7 @@ def settings():
                     session['username'] = new_username
                     username = new_username
                     success_msg = "Username updated."
-            
+
             if new_password and not error_msg:
                 if len(new_password) < 6:
                     error_msg = "Password must be at least 6 characters."
@@ -757,14 +764,14 @@ def settings():
                     }
                     save_json(SESSIONS_FILE, sessions)
                     success_msg = success_msg or "Password updated. All other sessions logged out."
-            
+
             log_activity('change_credentials', username)
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(username, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(username, {})
-    
+
     return render_template('settings.html',
                          success_msg=success_msg,
                          error_msg=error_msg,
@@ -777,17 +784,17 @@ def settings():
 def notifications():
     username = session['username']
     notifs = load_json(NOTIFS_FILE).get(username, [])
-    
+
     for n in notifs:
         n['read'] = True
     notifs_data = load_json(NOTIFS_FILE)
     notifs_data[username] = notifs
     save_json(NOTIFS_FILE, notifs_data)
-    
+
     users = load_json(USERS_FILE)
     unread = 0
     current_user_obj = users.get(username, {})
-    
+
     return render_template('notifications.html',
                          notifications=notifs,
                          unread_notifs=unread,
@@ -800,7 +807,7 @@ def subscriptions():
     subs = load_json(SUBS_FILE)
     users = load_json(USERS_FILE)
     videos = load_json(VIDEOS_FILE)
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
         target = request.form.get('target_user')
@@ -811,7 +818,7 @@ def subscriptions():
             subs[username] = user_subs
             save_json(SUBS_FILE, subs)
             return redirect(url_for('subscriptions'))
-    
+
     user_subs = subs.get(username, [])
     subscriptions_list = []
     for sub in user_subs:
@@ -820,7 +827,7 @@ def subscriptions():
             'name': sub,
             'profile_pic': sub_data.get('profile_pic', '')
         })
-    
+
     latest_videos = []
     for vid, v in videos.items():
         if v['uploader'] in user_subs:
@@ -829,14 +836,14 @@ def subscriptions():
                 uploader_data = users.get(v['uploader'], {})
                 v['uploader_pic'] = uploader_data.get('profile_pic', '')
                 latest_videos.append(v)
-    
+
     latest_videos.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(username, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(username, {})
-    
+
     return render_template('subscriptions.html',
                          subscriptions=subscriptions_list,
                          latest_videos=latest_videos[:50],
@@ -848,7 +855,7 @@ def subscriptions():
 def playlists():
     username = session['username']
     playlists_db = load_json(PLAYLISTS_FILE)
-    
+
     if request.method == 'POST':
         name = request.form.get('playlist_name', '').strip()
         if name:
@@ -861,20 +868,20 @@ def playlists():
             }
             save_json(PLAYLISTS_FILE, playlists_db)
             return redirect(url_for('playlists'))
-    
+
     user_playlists = []
     for pl_id, pl in playlists_db.items():
         if pl.get('owner') == username:
             pl['id'] = pl_id
             pl['video_count'] = len(pl.get('videos', []))
             user_playlists.append(pl)
-    
+
     users = load_json(USERS_FILE)
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(username, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(username, {})
-    
+
     return render_template('playlists.html',
                          playlists=user_playlists,
                          unread_notifs=unread,
@@ -886,18 +893,18 @@ def playlist_detail(pl_id):
     playlists_db = load_json(PLAYLISTS_FILE)
     videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
-    
+
     pl = playlists_db.get(pl_id)
     if not pl or pl.get('owner') != session['username']:
         abort(403)
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'delete_playlist':
             del playlists_db[pl_id]
             save_json(PLAYLISTS_FILE, playlists_db)
             return redirect(url_for('playlists'))
-    
+
     pl_videos = []
     for vid in pl.get('videos', []):
         if vid in videos:
@@ -906,12 +913,12 @@ def playlist_detail(pl_id):
             uploader_data = users.get(v['uploader'], {})
             v['uploader_pic'] = uploader_data.get('profile_pic', '')
             pl_videos.append(v)
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(session.get('username'), [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(session.get('username'), {})
-    
+
     return render_template('playlist_detail.html',
                          playlist=pl,
                          videos=pl_videos,
@@ -925,7 +932,7 @@ def saved_videos():
     saved_db = load_json(SAVED_FILE)
     videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
-    
+
     user_saved = saved_db.get(username, [])
     saved_videos_list = []
     for vid in user_saved:
@@ -936,12 +943,12 @@ def saved_videos():
                 uploader_data = users.get(v['uploader'], {})
                 v['uploader_pic'] = uploader_data.get('profile_pic', '')
                 saved_videos_list.append(v)
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(username, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(username, {})
-    
+
     return render_template('saved_videos.html',
                          videos=saved_videos_list,
                          unread_notifs=unread,
@@ -954,14 +961,14 @@ def watch_history():
     history_db = load_json(HISTORY_FILE)
     videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
         if action == 'clear_history':
             history_db[username] = []
             save_json(HISTORY_FILE, history_db)
             return redirect(url_for('watch_history'))
-    
+
     user_history = history_db.get(username, [])
     history_list = []
     for h in user_history:
@@ -974,14 +981,14 @@ def watch_history():
                 'uploader': v.get('uploader', 'Unknown'),
                 'watched_at': h.get('timestamp', '')
             })
-    
+
     history_list.reverse()
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(username, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(username, {})
-    
+
     return render_template('watch_history.html',
                          history=history_list,
                          unread_notifs=unread,
@@ -992,7 +999,7 @@ def watch_history():
 def users_list():
     users = load_json(USERS_FILE)
     current = session['username']
-    
+
     user_list = {}
     for u, data in users.items():
         if u != current:
@@ -1001,12 +1008,12 @@ def users_list():
                 'profile_pic': data.get('profile_pic', ''),
                 'is_online': u in online_users
             }
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(current, [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(current, {})
-    
+
     return render_template('users_list.html',
                          users=user_list,
                          unread_notifs=unread,
@@ -1023,13 +1030,13 @@ def admin_dashboard():
     sessions = load_json(SESSIONS_FILE)
     history_db = load_json(HISTORY_FILE)
     engage_db = load_json(ENGAGE_FILE)
-    
+
     admin_msg = request.args.get('msg', '')
     admin_msg_type = request.args.get('msg_type', '')
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
-        
+
         if action == 'toggle_ip_filter':
             config['ip_filter_enabled'] = request.form.get('ip_filter_enabled') == 'yes'
             config['strict_allowlist_mode'] = request.form.get('strict_allowlist_mode') == 'yes'
@@ -1037,7 +1044,7 @@ def admin_dashboard():
             config['allowed_ips'] = [ip.strip() for ip in request.form.get('allowed_ips', '').split('\n') if ip.strip()]
             save_json(CONFIG_FILE, config)
             log_activity('update_ip_filter', session['username'])
-        
+
         elif action == 'kill_stream':
             target = request.form.get('target_user')
             if target and is_valid_username(target) and target in live_streams:
@@ -1047,14 +1054,14 @@ def admin_dashboard():
                     pass
                 live_streams.pop(target, None)
                 log_activity(f'killed_stream_{target}', session['username'])
-        
+
         elif action == 'toggle_visibility':
             vid = request.form.get('target_vid')
             if vid and vid in videos:
                 current = videos[vid].get('visibility', 'visible')
                 videos[vid]['visibility'] = 'hidden' if current == 'visible' else 'visible'
                 save_json(VIDEOS_FILE, videos)
-        
+
         elif action == 'delete_video':
             vid = request.form.get('target_vid')
             if vid and vid in videos:
@@ -1065,13 +1072,13 @@ def admin_dashboard():
                         os.remove(filepath)
                 del videos[vid]
                 save_json(VIDEOS_FILE, videos)
-        
+
         elif action == 'revoke_session':
             sid = request.form.get('revoke_sid')
             if sid and sid in sessions:
                 del sessions[sid]
                 save_json(SESSIONS_FILE, sessions)
-        
+
         elif action == 'create_user':
             new_user = request.form.get('new_user', '').strip()
             new_pass = request.form.get('new_pass', '')
@@ -1176,7 +1183,7 @@ def admin_dashboard():
             else:
                 return redirect(url_for('admin_dashboard', msg='Cannot delete admin or invalid user', msg_type='error'))
         return redirect(url_for('admin_dashboard'))
-    
+
     metrics = []
     for user, history in history_db.items():
         total_mins = sum(h.get('duration', 0) for h in history) // 60
@@ -1187,12 +1194,12 @@ def admin_dashboard():
             'total_mins': total_mins,
             'history': history_str or 'No history'
         })
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(session['username'], [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(session['username'], {})
-    
+
     # Pagination for active sessions
     sessions_page = request.args.get('sessions_page', 1, type=int)
     per_page = 7
@@ -1225,15 +1232,15 @@ def admin_dashboard():
 def admin_user_history(target_user):
     if not is_valid_username(target_user):
         abort(404)
-    
+
     history_db = load_json(HISTORY_FILE)
     videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
-    
+
     user_history = history_db.get(target_user, [])
     history_list = []
     total_mins = 0
-    
+
     for h in user_history:
         vid = h.get('video_id')
         if vid and vid in videos:
@@ -1245,14 +1252,14 @@ def admin_user_history(target_user):
                 'watched_at': h.get('timestamp', '')
             })
             total_mins += h.get('duration', 0) // 60
-    
+
     history_list.reverse()
-    
+
     unread = 0
     notifs = load_json(NOTIFS_FILE).get(session['username'], [])
     unread = sum(1 for n in notifs if not n.get('read'))
     current_user_obj = users.get(session['username'], {})
-    
+
     return render_template('admin_user_history.html',
                          target_user=target_user,
                          history=history_list,
@@ -1296,17 +1303,17 @@ def track_engagement():
     data = request.get_json()
     video_id = data.get('video_id')
     seconds = data.get('seconds', 5)
-    
+
     engage = load_json(ENGAGE_FILE)
     user = session['username']
-    
+
     if user not in engage:
         engage[user] = {}
     if video_id not in engage[user]:
         engage[user][video_id] = 0
     engage[user][video_id] += seconds
     save_json(ENGAGE_FILE, engage)
-    
+
     return jsonify({'status': 'ok'})
 
 @app.route('/api/like_comment', methods=['POST'])
@@ -1315,10 +1322,10 @@ def like_comment():
     data = request.get_json()
     video_id = data.get('video_id')
     comment_id = data.get('comment_id')
-    
+
     comments_db = load_json(COMMENTS_FILE)
     comments = comments_db.get(video_id, [])
-    
+
     def find_and_like(comment_list):
         for c in comment_list:
             if c['id'] == comment_id:
@@ -1334,13 +1341,13 @@ def like_comment():
                 if result is not None:
                     return result
         return None
-    
+
     likes_count = find_and_like(comments)
     if likes_count is not None:
         comments_db[video_id] = comments
         save_json(COMMENTS_FILE, comments_db)
         return jsonify({'status': 'ok', 'likes': likes_count})
-    
+
     return jsonify({'status': 'error'}), 404
 
 @app.route('/api/save_video', methods=['POST'])
@@ -1348,20 +1355,20 @@ def like_comment():
 def save_video():
     data = request.get_json()
     video_id = data.get('video_id')
-    
+
     saved_db = load_json(SAVED_FILE)
     user = session['username']
-    
+
     if user not in saved_db:
         saved_db[user] = []
-    
+
     saved = False
     if video_id in saved_db[user]:
         saved_db[user].remove(video_id)
     else:
         saved_db[user].append(video_id)
         saved = True
-    
+
     save_json(SAVED_FILE, saved_db)
     return jsonify({'status': 'ok', 'saved': saved})
 
@@ -1370,23 +1377,23 @@ def save_video():
 def api_watch_history():
     data = request.get_json()
     video_id = data.get('video_id')
-    
+
     history_db = load_json(HISTORY_FILE)
     videos = load_json(VIDEOS_FILE)
     user = session['username']
-    
+
     if user not in history_db:
         history_db[user] = []
-    
+
     history_db[user].append({
         'video_id': video_id,
         'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         'duration': 5
     })
-    
+
     history_db[user] = history_db[user][-500:]
     save_json(HISTORY_FILE, history_db)
-    
+
     return jsonify({'status': 'ok'})
 
 @app.route('/api/playlists', methods=['GET', 'POST'])
@@ -1394,7 +1401,7 @@ def api_watch_history():
 def api_playlists():
     playlists_db = load_json(PLAYLISTS_FILE)
     user = session['username']
-    
+
     if request.method == 'POST':
         name = request.get_json().get('name', '').strip()
         if name:
@@ -1407,7 +1414,7 @@ def api_playlists():
             }
             save_json(PLAYLISTS_FILE, playlists_db)
             return jsonify({'status': 'ok', 'id': pl_id})
-    
+
     user_playlists = []
     for pl_id, pl in playlists_db.items():
         if pl.get('owner') == user:
@@ -1416,7 +1423,7 @@ def api_playlists():
                 'name': pl['name'],
                 'video_count': len(pl.get('videos', []))
             })
-    
+
     return jsonify({'playlists': user_playlists})
 
 @app.route('/api/playlists/<pl_id>/videos', methods=['POST'])
@@ -1425,16 +1432,16 @@ def api_add_to_playlist(pl_id):
     playlists_db = load_json(PLAYLISTS_FILE)
     data = request.get_json()
     video_id = data.get('video_id')
-    
+
     pl = playlists_db.get(pl_id)
     if not pl or pl.get('owner') != session['username']:
         return jsonify({'status': 'error', 'message': 'Not found'}), 404
-    
+
     if video_id not in pl.get('videos', []):
         pl['videos'].append(video_id)
         save_json(PLAYLISTS_FILE, playlists_db)
         return jsonify({'status': 'ok', 'message': 'Added to playlist'})
-    
+
     return jsonify({'status': 'ok', 'message': 'Already in playlist'})
 
 # ==================== MEDIA SERVING ====================
@@ -1516,7 +1523,7 @@ def handle_webrtc(data):
                 break
         if not target_sid:
             target_sid = online_users.get(target)
-        
+
         if target_sid:
             emit('webrtc_signal', {
                 'sender': request.sid,
@@ -1531,94 +1538,867 @@ templates = {
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="theme-color" content="#ff0000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>FamTube</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.js"></script>
     <script>function getCookie(n) { let m = document.cookie.match(new RegExp('(^| )'+n+'=([^;]+)')); return m?m[2]:null; } if (getCookie('theme') === 'dark') document.documentElement.classList.add('dark-mode');</script>
     <style>
-        html, body { margin: 0; height: 100%; font-family: 'Roboto', Arial, sans-serif; background: #f9f9f9; color: #0f0f0f; display: flex; flex-direction: column; }
-        .navbar { display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 100; }
-        .logo { font-size: 22px; font-weight: bold; color: #ff0000; text-decoration: none; display: flex; align-items: center; gap: 10px; }
-        .search-bar { display: flex; flex: 1; max-width: 500px; margin: 0 20px; }
-        .search-bar input { width: 100%; padding: 8px 15px; border-radius: 20px 0 0 20px; border: 1px solid #ccc; border-right: none; }
-        .search-bar button { padding: 8px 20px; border-radius: 0 20px 20px 0; border: 1px solid #ccc; background: #f8f8f8; cursor: pointer; color: black; }
-        .nav-links { display: flex; align-items: center; gap: 15px; }
-        .nav-links a { text-decoration: none; color: #0f0f0f; font-weight: 500; font-size: 14px; position: relative;}
-        .btn-upload, .btn-live { padding: 8px 15px; border-radius: 20px; text-decoration: none; font-weight: bold; border: 1px solid #ccc; font-size: 13px; }
-        .btn-upload { background: #f2f2f2; color: black !important; }
-        .btn-live { background: #ff0000; color: white !important; border: none; animation: pulse 2s infinite; }
-        .badge { position: absolute; top: -8px; right: -10px; background: #ff0000; color: white; font-size: 10px; padding: 2px 6px; border-radius: 10px; font-weight: bold; }
-        .sidebar { position: fixed; top: 0; left: -250px; width: 250px; height: 100%; background: white; box-shadow: 2px 0 5px rgba(0,0,0,0.1); transition: left 0.3s ease; z-index: 1000; display: flex; flex-direction: column; }
-        .sidebar.open { left: 0; }
-        .sidebar-header { padding: 20px; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }
-        .sidebar-links a { display: block; padding: 15px 20px; color: inherit; text-decoration: none; font-weight: bold; border-bottom: 1px solid #eee; }
-        .overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; z-index: 999; }
-        .overlay.open { display: block; }
-        .container { padding: 25px; max-width: 1200px; margin: auto; flex: 1 0 auto; width: 100%; box-sizing: border-box; }
-        .footer { text-align: center; padding: 20px; color: #888; font-size: 13px; font-weight: bold; border-top: 1px solid #eaeaea;}
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
-        .card { background: white; border-radius: 12px; overflow: hidden; text-decoration: none; color: inherit; display: block; box-shadow: 0 2px 5px rgba(0,0,0,0.05); position:relative;}
-        .thumbnail { width: 100%; height: 160px; background: #000; display:flex; align-items:center; justify-content:center; color:white; font-size: 40px; }
-        .card-info { padding: 12px; display: flex; gap: 10px;}
-        .card-title { margin: 0 0 5px 0; font-size: 16px; font-weight: bold; }
-        .card-meta { margin: 0; color: #606060; font-size: 14px; }
-
-        .avatar-container { position: relative; display: inline-block; flex-shrink: 0; width: 40px; height: 40px; }
-        .avatar-container-large { width: 100px; height: 100px; margin: auto; margin-bottom: 15px; }
-        .avatar { width: 100%; height: 100%; border-radius: 50%; background: #065fd4; color: white; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 18px; object-fit: cover;}
-        .avatar-large { font-size: 40px; }
-        .online-dot { position: absolute; bottom: 0; right: 0; width: 12px; height: 12px; background-color: #4CAF50; border-radius: 50%; border: 2px solid white; box-sizing: border-box; }
-        .offline-dot { background-color: #9e9e9e !important; }
-
-        .admin-panel { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
-        th, td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
-        input[type="text"], input[type="password"], textarea, select { padding: 10px; margin: 5px 0; border-radius: 6px; border: 1px solid #ccc; width: 100%; box-sizing: border-box; }
-        button.primary-btn { background: #065fd4; color: white; border: none; cursor: pointer; font-weight: bold; padding: 10px 15px; border-radius: 6px; }
-        #toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; }
-        .toast { background: #333; color: white; padding: 15px 20px; border-radius: 8px; transform: translateX(120%); transition: transform 0.3s ease; display: flex; align-items: center; gap: 10px;}
-        .toast.show { transform: translateX(0); }
-        .private-badge { position:absolute; top:10px; right:10px; background:rgba(0,0,0,0.7); color:white; padding:4px 8px; border-radius:4px; font-size:11px; font-weight:bold;}
-
-        .hashtag-chip { display: inline-block; padding: 6px 14px; border-radius: 20px; background: #f0f0f0; color: #065fd4; font-weight: bold; font-size: 13px; text-decoration: none; margin: 4px; transition: all 0.2s; cursor: pointer; border: none; }
-        .hashtag-chip:hover, .hashtag-chip.active { background: #065fd4; color: white; }
-        .hashtag-chip.active { box-shadow: 0 0 0 2px #3ea6ff; }
-        html.dark-mode .hashtag-chip { background: #2c2c2c; color: #3ea6ff; }
-        html.dark-mode .hashtag-chip:hover, html.dark-mode .hashtag-chip.active { background: #3ea6ff; color: #121212; }
-
-        html.dark-mode, html.dark-mode body { background-color: #121212; color: #e0e0e0; }
-        html.dark-mode .navbar, html.dark-mode .sidebar { background-color: #1e1e1e; border-color: #333; box-shadow: none; }
-        html.dark-mode .sidebar-header, html.dark-mode .sidebar-links a { border-color: #333; }
-        html.dark-mode .search-bar input, html.dark-mode input, html.dark-mode textarea, html.dark-mode select { background-color: #2c2c2c; color: #fff; border-color: #444; }
-        html.dark-mode .search-bar button, html.dark-mode .btn-upload { background-color: #333; border-color: #444; color: white !important; }
-        html.dark-mode .card, html.dark-mode .admin-panel { background-color: #1e1e1e; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-        html.dark-mode th, html.dark-mode td { border-color: #333; }
-        html.dark-mode .card-meta { color: #aaa; }
-        html.dark-mode .footer { border-color: #333; color: #666; }
-        html.dark-mode .dark-box { background-color: #2a2a2a !important; border-left: 4px solid #3ea6ff;}
-        html.dark-mode .online-dot { border-color: #1e1e1e; }
-        .tags { color: #065fd4; font-size: 13px; font-weight: bold; }
-        html.dark-mode .tags { color: #3ea6ff; }
-        @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.05); } 100% { transform: scale(1); } }
-
-        @media (max-width: 768px) {
-            .navbar { flex-wrap: wrap; padding: 8px 12px; }
-            .search-bar { order: 3; max-width: 100%; margin: 10px 0 0 0; width: 100%; }
-            .nav-links { gap: 8px; }
-            .btn-upload, .btn-live { padding: 6px 10px; font-size: 11px; }
-            .grid { grid-template-columns: 1fr; gap: 15px; }
-            .container { padding: 12px; }
-            .sidebar { width: 80%; left: -80%; }
-            .sidebar.open { left: 0; }
-            .card-info { gap: 8px; }
-            .avatar-container { width: 36px; height: 36px; }
-            table { font-size: 12px; }
-            th, td { padding: 6px; }
-            h2 { font-size: 20px; }
-            .thumbnail { height: 200px; }
+        /* ===== ENHANCED RESPONSIVE DESIGN ===== */
+        html, body { 
+            margin: 0; 
+            height: 100%; 
+            font-family: 'Roboto', Arial, sans-serif; 
+            background: #f9f9f9; 
+            color: #0f0f0f; 
+            display: flex; 
+            flex-direction: column; 
+            -webkit-tap-highlight-color: transparent;
         }
+
+        /* Navbar - Enhanced for all screens */
+        .navbar { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            padding: 10px 20px; 
+            background: white; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+            position: sticky; 
+            top: 0; 
+            z-index: 100; 
+            flex-wrap: nowrap;
+            gap: 10px;
+        }
+
+        .logo { 
+            font-size: 22px; 
+            font-weight: bold; 
+            color: #ff0000; 
+            text-decoration: none; 
+            display: flex; 
+            align-items: center; 
+            gap: 10px; 
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .search-bar { 
+            display: flex; 
+            flex: 1; 
+            max-width: 500px; 
+            margin: 0 20px; 
+            min-width: 0;
+        }
+
+        .search-bar input { 
+            width: 100%; 
+            padding: 8px 15px; 
+            border-radius: 20px 0 0 20px; 
+            border: 1px solid #ccc; 
+            border-right: none; 
+            font-size: 14px;
+            min-width: 0;
+        }
+
+        .search-bar button { 
+            padding: 8px 20px; 
+            border-radius: 0 20px 20px 0; 
+            border: 1px solid #ccc; 
+            background: #f8f8f8; 
+            cursor: pointer; 
+            color: black; 
+            white-space: nowrap;
+        }
+
+        .nav-links { 
+            display: flex; 
+            align-items: center; 
+            gap: 15px; 
+            flex-shrink: 0;
+        }
+
+        .nav-links a { 
+            text-decoration: none; 
+            color: #0f0f0f; 
+            font-weight: 500; 
+            font-size: 14px; 
+            position: relative;
+            white-space: nowrap;
+        }
+
+        .btn-upload, .btn-live { 
+            padding: 8px 15px; 
+            border-radius: 20px; 
+            text-decoration: none; 
+            font-weight: bold; 
+            border: 1px solid #ccc; 
+            font-size: 13px; 
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .btn-upload { 
+            background: #f2f2f2; 
+            color: black !important; 
+        }
+
+        .btn-live { 
+            background: #ff0000; 
+            color: white !important; 
+            border: none; 
+            animation: pulse 2s infinite; 
+        }
+
+        .badge { 
+            position: absolute; 
+            top: -8px; 
+            right: -10px; 
+            background: #ff0000; 
+            color: white; 
+            font-size: 10px; 
+            padding: 2px 6px; 
+            border-radius: 10px; 
+            font-weight: bold; 
+        }
+
+        /* Sidebar - Enhanced mobile experience */
+        .sidebar { 
+            position: fixed; 
+            top: 0; 
+            left: -280px; 
+            width: 280px; 
+            height: 100%; 
+            background: white; 
+            box-shadow: 2px 0 10px rgba(0,0,0,0.15); 
+            transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1); 
+            z-index: 1000; 
+            display: flex; 
+            flex-direction: column;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .sidebar.open { left: 0; }
+
+        .sidebar-header { 
+            padding: 20px; 
+            border-bottom: 1px solid #ddd; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            position: sticky;
+            top: 0;
+            background: white;
+            z-index: 1;
+        }
+
+        .sidebar-links a { 
+            display: block; 
+            padding: 15px 20px; 
+            color: inherit; 
+            text-decoration: none; 
+            font-weight: bold; 
+            border-bottom: 1px solid #eee; 
+            font-size: 15px;
+            transition: background 0.2s;
+        }
+
+        .sidebar-links a:hover, .sidebar-links a:active {
+            background: rgba(6, 95, 212, 0.08);
+        }
+
+        .overlay { 
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            background: rgba(0,0,0,0.5); 
+            display: none; 
+            z-index: 999; 
+            backdrop-filter: blur(2px);
+        }
+
+        .overlay.open { display: block; }
+
+        .container { 
+            padding: 25px; 
+            max-width: 1200px; 
+            margin: auto; 
+            flex: 1 0 auto; 
+            width: 100%; 
+            box-sizing: border-box; 
+        }
+
+        .footer { 
+            text-align: center; 
+            padding: 20px; 
+            color: #888; 
+            font-size: 13px; 
+            font-weight: bold; 
+            border-top: 1px solid #eaeaea;
+        }
+
+        /* Grid - Enhanced responsive */
+        .grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); 
+            gap: 20px; 
+        }
+
+        .card { 
+            background: white; 
+            border-radius: 12px; 
+            overflow: hidden; 
+            text-decoration: none; 
+            color: inherit; 
+            display: block; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05); 
+            position:relative;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+
+        .thumbnail { 
+            width: 100%; 
+            height: 160px; 
+            background: #000; 
+            display:flex; 
+            align-items:center; 
+            justify-content:center; 
+            color:white; 
+            font-size: 40px; 
+            position: relative;
+            overflow: hidden;
+        }
+
+        .card-info { 
+            padding: 12px; 
+            display: flex; 
+            gap: 10px;
+        }
+
+        .card-title { 
+            margin: 0 0 5px 0; 
+            font-size: 16px; 
+            font-weight: bold; 
+            line-height: 1.3;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .card-meta { 
+            margin: 0; 
+            color: #606060; 
+            font-size: 14px; 
+        }
+
+        /* Avatar enhancements */
+        .avatar-container { 
+            position: relative; 
+            display: inline-block; 
+            flex-shrink: 0; 
+            width: 40px; 
+            height: 40px; 
+        }
+
+        .avatar-container-large { 
+            width: 100px; 
+            height: 100px; 
+            margin: auto; 
+            margin-bottom: 15px; 
+        }
+
+        .avatar { 
+            width: 100%; 
+            height: 100%; 
+            border-radius: 50%; 
+            background: #065fd4; 
+            color: white; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            font-weight: bold; 
+            font-size: 18px; 
+            object-fit: cover;
+        }
+
+        .avatar-large { 
+            font-size: 40px; 
+        }
+
+        .online-dot { 
+            position: absolute; 
+            bottom: 0; 
+            right: 0; 
+            width: 12px; 
+            height: 12px; 
+            background-color: #4CAF50; 
+            border-radius: 50%; 
+            border: 2px solid white; 
+            box-sizing: border-box; 
+        }
+
+        .offline-dot { 
+            background-color: #9e9e9e !important; 
+        }
+
+        /* Admin panel & tables */
+        .admin-panel { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 8px; 
+            margin-bottom: 20px; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1); 
+        }
+
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 10px; 
+            font-size: 14px; 
+        }
+
+        th, td { 
+            padding: 10px; 
+            border-bottom: 1px solid #ddd; 
+            text-align: left; 
+        }
+
+        /* Form inputs */
+        input[type="text"], input[type="password"], textarea, select { 
+            padding: 10px; 
+            margin: 5px 0; 
+            border-radius: 6px; 
+            border: 1px solid #ccc; 
+            width: 100%; 
+            box-sizing: border-box; 
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        input[type="file"] {
+            font-size: 14px;
+        }
+
+        button.primary-btn { 
+            background: #065fd4; 
+            color: white; 
+            border: none; 
+            cursor: pointer; 
+            font-weight: bold; 
+            padding: 10px 15px; 
+            border-radius: 6px; 
+            font-size: 14px;
+            transition: background 0.2s;
+            touch-action: manipulation;
+        }
+
+        button.primary-btn:hover {
+            background: #0549a8;
+        }
+
+        button.primary-btn:active {
+            transform: scale(0.98);
+        }
+
+        /* Toast notifications */
+        #toast-container { 
+            position: fixed; 
+            bottom: 20px; 
+            right: 20px; 
+            z-index: 9999; 
+            display: flex; 
+            flex-direction: column; 
+            gap: 10px; 
+            max-width: 90vw;
+        }
+
+        .toast { 
+            background: #333; 
+            color: white; 
+            padding: 15px 20px; 
+            border-radius: 8px; 
+            transform: translateX(120%); 
+            transition: transform 0.3s ease; 
+            display: flex; 
+            align-items: center; 
+            gap: 10px;
+            font-size: 14px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+
+        .toast.show { 
+            transform: translateX(0); 
+        }
+
+        /* Badges & chips */
+        .private-badge { 
+            position:absolute; 
+            top:10px; 
+            right:10px; 
+            background:rgba(0,0,0,0.7); 
+            color:white; 
+            padding:4px 8px; 
+            border-radius:4px; 
+            font-size:11px; 
+            font-weight:bold;
+        }
+
+        .hashtag-chip { 
+            display: inline-block; 
+            padding: 6px 14px; 
+            border-radius: 20px; 
+            background: #f0f0f0; 
+            color: #065fd4; 
+            font-weight: bold; 
+            font-size: 13px; 
+            text-decoration: none; 
+            margin: 4px; 
+            transition: all 0.2s; 
+            cursor: pointer; 
+            border: none; 
+            touch-action: manipulation;
+        }
+
+        .hashtag-chip:hover, .hashtag-chip.active { 
+            background: #065fd4; 
+            color: white; 
+        }
+
+        .hashtag-chip.active { 
+            box-shadow: 0 0 0 2px #3ea6ff; 
+        }
+
+        .tags { 
+            color: #065fd4; 
+            font-size: 13px; 
+            font-weight: bold; 
+        }
+
+        /* Dark mode */
+        html.dark-mode, html.dark-mode body { 
+            background-color: #121212; 
+            color: #e0e0e0; 
+        }
+
+        html.dark-mode .navbar, html.dark-mode .sidebar { 
+            background-color: #1e1e1e; 
+            border-color: #333; 
+            box-shadow: none; 
+        }
+
+        html.dark-mode .sidebar-header { 
+            background-color: #1e1e1e;
+            border-color: #333; 
+        }
+
+        html.dark-mode .sidebar-links a { 
+            border-color: #333; 
+        }
+
+        html.dark-mode .search-bar input, 
+        html.dark-mode input, 
+        html.dark-mode textarea, 
+        html.dark-mode select { 
+            background-color: #2c2c2c; 
+            color: #fff; 
+            border-color: #444; 
+        }
+
+        html.dark-mode .search-bar button, 
+        html.dark-mode .btn-upload { 
+            background-color: #333; 
+            border-color: #444; 
+            color: white !important; 
+        }
+
+        html.dark-mode .card, 
+        html.dark-mode .admin-panel { 
+            background-color: #1e1e1e; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3); 
+        }
+
+        html.dark-mode th, 
+        html.dark-mode td { 
+            border-color: #333; 
+        }
+
+        html.dark-mode .card-meta { 
+            color: #aaa; 
+        }
+
+        html.dark-mode .footer { 
+            border-color: #333; 
+            color: #666; 
+        }
+
+        html.dark-mode .dark-box { 
+            background-color: #2a2a2a !important; 
+            border-left: 4px solid #3ea6ff;
+        }
+
+        html.dark-mode .online-dot { 
+            border-color: #1e1e1e; 
+        }
+
+        html.dark-mode .hashtag-chip { 
+            background: #2c2c2c; 
+            color: #3ea6ff; 
+        }
+
+        html.dark-mode .hashtag-chip:hover, 
+        html.dark-mode .hashtag-chip.active { 
+            background: #3ea6ff; 
+            color: #121212; 
+        }
+
+        html.dark-mode .tags { 
+            color: #3ea6ff; 
+        }
+
+        html.dark-mode .overlay {
+            background: rgba(0,0,0,0.7);
+        }
+
+        /* Animations */
+        @keyframes pulse { 
+            0% { transform: scale(1); } 
+            50% { transform: scale(1.05); } 
+            100% { transform: scale(1); } 
+        }
+
+        /* ===== MOBILE RESPONSIVE (up to 768px) ===== */
+        @media (max-width: 768px) {
+            .navbar { 
+                flex-wrap: wrap; 
+                padding: 8px 12px; 
+                gap: 8px;
+            }
+
+            .navbar > div:first-child {
+                flex-shrink: 0;
+            }
+
+            .search-bar { 
+                order: 3; 
+                max-width: 100%; 
+                margin: 0; 
+                width: 100%; 
+            }
+
+            .search-bar input {
+                padding: 6px 12px;
+                font-size: 14px;
+            }
+
+            .search-bar button {
+                padding: 6px 14px;
+            }
+
+            .nav-links { 
+                gap: 8px; 
+                flex-wrap: wrap;
+                justify-content: flex-end;
+            }
+
+            .nav-links a {
+                font-size: 13px;
+            }
+
+            .btn-upload, .btn-live { 
+                padding: 6px 10px; 
+                font-size: 12px; 
+            }
+
+            .logo {
+                font-size: 18px;
+            }
+
+            .badge {
+                top: -6px;
+                right: -6px;
+                padding: 1px 5px;
+                font-size: 9px;
+            }
+
+            .grid { 
+                grid-template-columns: 1fr; 
+                gap: 15px; 
+            }
+
+            .container { 
+                padding: 12px; 
+            }
+
+            .sidebar { 
+                width: 85%; 
+                left: -85%; 
+                max-width: 320px;
+            }
+
+            .sidebar.open { 
+                left: 0; 
+            }
+
+            .card-info { 
+                gap: 8px; 
+                padding: 10px;
+            }
+
+            .avatar-container { 
+                width: 36px; 
+                height: 36px; 
+            }
+
+            .card-title {
+                font-size: 15px;
+            }
+
+            table { 
+                font-size: 12px; 
+                display: block;
+                overflow-x: auto;
+                white-space: nowrap;
+                -webkit-overflow-scrolling: touch;
+            }
+
+            th, td { 
+                padding: 8px; 
+            }
+
+            h2 { 
+                font-size: 20px; 
+            }
+
+            h3 {
+                font-size: 18px;
+            }
+
+            .thumbnail { 
+                height: 200px; 
+            }
+
+            .admin-panel {
+                padding: 15px;
+            }
+
+            input[type="text"], 
+            input[type="password"], 
+            textarea, 
+            select {
+                padding: 8px;
+                font-size: 16px; /* Prevents iOS zoom */
+            }
+
+            button.primary-btn {
+                padding: 10px 15px;
+                min-height: 44px; /* Touch target */
+            }
+
+            #toast-container {
+                left: 10px;
+                right: 10px;
+                bottom: 10px;
+                align-items: center;
+            }
+
+            .toast {
+                width: 100%;
+                max-width: 400px;
+                justify-content: center;
+            }
+
+            /* Mobile comment section improvements */
+            .comment-wrapper {
+                gap: 8px !important;
+            }
+
+            .replies-box {
+                padding-left: 10px !important;
+            }
+
+            /* Mobile modal improvements */
+            #playlistModal > div,
+            [style*="max-width:400px"] {
+                max-width: 95vw !important;
+                margin: 10px !important;
+            }
+
+            /* Mobile form improvements */
+            form[style*="display:flex"] {
+                flex-direction: column !important;
+                gap: 8px !important;
+            }
+
+            form[style*="display:flex"] input,
+            form[style*="display:flex"] button {
+                width: 100% !important;
+                margin: 0 !important;
+            }
+
+            /* Mobile video player */
+            #videoContainer {
+                border-radius: 4px !important;
+            }
+
+            /* Mobile profile */
+            .avatar-container-large {
+                width: 80px !important;
+                height: 80px !important;
+            }
+
+            .avatar-large {
+                font-size: 32px !important;
+            }
+        }
+
+        /* ===== TABLET RESPONSIVE (769px - 1024px) ===== */
         @media (min-width: 769px) and (max-width: 1024px) {
-            .grid { grid-template-columns: repeat(2, 1fr); }
+            .grid { 
+                grid-template-columns: repeat(2, 1fr); 
+            }
+
+            .container {
+                padding: 20px;
+            }
+
+            .sidebar {
+                width: 260px;
+                left: -260px;
+            }
+
+            .search-bar {
+                max-width: 350px;
+            }
+        }
+
+        /* ===== SMALL MOBILE (up to 480px) ===== */
+        @media (max-width: 480px) {
+            .navbar {
+                padding: 6px 8px;
+            }
+
+            .logo {
+                font-size: 16px;
+                gap: 6px;
+            }
+
+            .nav-links {
+                gap: 6px;
+            }
+
+            .btn-upload, .btn-live {
+                padding: 5px 8px;
+                font-size: 11px;
+            }
+
+            .thumbnail {
+                height: 180px;
+            }
+
+            .card-title {
+                font-size: 14px;
+            }
+
+            .card-meta {
+                font-size: 12px;
+            }
+
+            .container {
+                padding: 8px;
+            }
+
+            h2 {
+                font-size: 18px;
+            }
+
+            .admin-panel {
+                padding: 12px;
+                border-radius: 6px;
+            }
+
+            table {
+                font-size: 11px;
+            }
+
+            th, td {
+                padding: 6px 4px;
+            }
+
+            /* Ensure buttons are tappable */
+            button, 
+            a.btn-upload, 
+            a.btn-live,
+            .hashtag-chip,
+            .primary-btn {
+                min-height: 36px;
+                min-width: 36px;
+            }
+        }
+
+        /* ===== LARGE SCREENS (1400px+) ===== */
+        @media (min-width: 1400px) {
+            .container {
+                max-width: 1400px;
+            }
+
+            .grid {
+                grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                gap: 24px;
+            }
+
+            .thumbnail {
+                height: 180px;
+            }
+        }
+
+        /* ===== LANDSCAPE MOBILE ===== */
+        @media (max-height: 500px) and (orientation: landscape) {
+            .navbar {
+                position: relative;
+            }
+
+            .thumbnail {
+                height: 120px;
+            }
+        }
+
+        /* Safe area for notched devices */
+        @supports (padding: max(0px)) {
+            .navbar {
+                padding-left: max(20px, env(safe-area-inset-left));
+                padding-right: max(20px, env(safe-area-inset-right));
+            }
+
+            .container {
+                padding-left: max(25px, env(safe-area-inset-left));
+                padding-right: max(25px, env(safe-area-inset-right));
+            }
+
+            @media (max-width: 768px) {
+                .navbar {
+                    padding-left: max(12px, env(safe-area-inset-left));
+                    padding-right: max(12px, env(safe-area-inset-right));
+                }
+
+                .container {
+                    padding-left: max(12px, env(safe-area-inset-left));
+                    padding-right: max(12px, env(safe-area-inset-right));
+                }
+            }
         }
     </style>
 </head>
@@ -2011,7 +2791,7 @@ templates = {
         {% if not hide_last_seen %}
         <p style="color: #888; font-size: 12px; margin: 5px 0;">Last seen: {{ last_seen }}</p>
         {% endif %}
-        <div style="display: flex; justify-content: center; gap: 10px; margin-top: 15px;">
+        <div style="display: flex; justify-content: center; gap: 10px; margin-top: 15px; flex-wrap: wrap;">
             {% if session.username != profile_name %}
             <form method="POST" style="margin:0;">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
@@ -2076,9 +2856,25 @@ templates = {
 <div style="max-width: 800px; margin: auto; text-align: center;">
     <h2>🔴 Go Live</h2>
     <div class="admin-panel">
+        <div id="permWarning" style="display:none; background:#fff3e0; color:#e65100; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px; font-weight:bold; text-align:left;">
+            ⚠️ <b>Camera/Microphone Access Required</b><br>
+            Live streaming requires browser permission to access your camera and microphone.<br><br>
+            <b>Android / Chrome:</b> You MUST access this site via <b>HTTPS</b> or <b>localhost</b>. HTTP IP addresses are blocked by Chrome for security.<br>
+            <b>Windows:</b> Check Settings → Privacy → Camera / Microphone → Allow desktop apps access.<br>
+            <b>Linux:</b> Ensure your browser has permission to access <code>/dev/video*</code> and audio devices (check PipeWire/PulseAudio).<br><br>
+            <button onclick="requestMediaAccess()" class="primary-btn" style="background:#ff9800; width:100%;">🔐 Request Camera & Microphone Permission</button>
+        </div>
+        <div id="secureWarning" style="display:none; background:#ffebee; color:#c62828; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px; font-weight:bold; text-align:left;">
+            ❌ <b>Insecure Context Detected</b><br>
+            Your browser blocks camera/microphone on HTTP (except localhost). Please:<br>
+            • Access via <b>https://</b> (recommended)<br>
+            • Or use <b>http://localhost:5000</b> only<br>
+            • Android WebView apps must enable HTTPS and add <code>RECORD_AUDIO</code> + <code>CAMERA</code> to AndroidManifest.xml
+        </div>
         <input type="text" id="streamTitle" placeholder="Stream Title" style="max-width: 400px; margin: 0 auto 15px; display: block;">
-        <div style="display: flex; gap: 15px; justify-content: center; margin-bottom: 20px;">
-            <button id="startBtn" class="primary-btn" style="background: #ff0000;">Start Stream</button>
+        <div style="display: flex; gap: 15px; justify-content: center; margin-bottom: 20px; flex-wrap: wrap;">
+            <button id="startBtn" class="primary-btn" style="background: #ff0000; display:none;">Start Stream</button>
+            <button id="requestBtn" class="primary-btn" style="background: #ff9800;" onclick="requestMediaAccess()">🔐 Allow Camera & Mic</button>
             <button id="stopBtn" class="primary-btn" style="background: #555; display: none;">Stop Stream</button>
         </div>
         <video id="localVideo" autoplay muted playsinline style="width: 100%; max-width: 600px; background: #000; border-radius: 8px;"></video>
@@ -2091,18 +2887,85 @@ let localStream = null;
 let peerConnections = {};
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
+function isSecure() {
+    return window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+}
+
+function hasMediaApi() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+}
+
+async function queryPermissions() {
+    try {
+        if (navigator.permissions) {
+            const cam = await navigator.permissions.query({ name: 'camera' });
+            const mic = await navigator.permissions.query({ name: 'microphone' });
+            return { camera: cam.state, microphone: mic.state };
+        }
+    } catch (e) {}
+    return null;
+}
+
+async function requestMediaAccess() {
+    const statusText = document.getElementById('statusText');
+    const permWarning = document.getElementById('permWarning');
+    const secureWarning = document.getElementById('secureWarning');
+    const requestBtn = document.getElementById('requestBtn');
+    const startBtn = document.getElementById('startBtn');
+
+    if (!isSecure()) {
+        secureWarning.style.display = 'block';
+        permWarning.style.display = 'none';
+        return;
+    }
+    secureWarning.style.display = 'none';
+
+    if (!hasMediaApi()) {
+        alert('Your browser does not support camera/microphone access. Please use Chrome, Firefox, Edge, or Safari.');
+        return;
+    }
+
+    try {
+        statusText.innerText = 'Requesting camera & microphone...';
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+            audio: { echoCancellation: true, noiseSuppression: true }
+        });
+        localStream = stream;
+        document.getElementById('localVideo').srcObject = stream;
+        permWarning.style.display = 'none';
+        requestBtn.style.display = 'none';
+        startBtn.style.display = 'inline-block';
+        statusText.innerText = '✅ Camera & Microphone ready. Click Start Stream.';
+    } catch (err) {
+        console.error('getUserMedia error:', err.name, err.message);
+        let msg = 'Could not access camera/microphone. ';
+        if (err.name === 'NotAllowedError') {
+            msg += 'Permission was denied. On Android, ensure you are on HTTPS and tap Allow. On Windows/Linux, check OS privacy settings for browser camera/microphone access.';
+        } else if (err.name === 'NotFoundError') {
+            msg += 'No camera or microphone found. Please connect a device.';
+        } else if (err.name === 'NotReadableError') {
+            msg += 'Camera or microphone is already in use by another application (Zoom, Teams, etc.). Close other apps and try again.';
+        } else if (err.name === 'OverconstrainedError') {
+            msg += 'Camera does not support requested settings. Try a different device.';
+        } else {
+            msg += err.message;
+        }
+        statusText.innerText = msg;
+        permWarning.style.display = 'block';
+    }
+}
+
 document.getElementById('startBtn').onclick = async () => {
     const title = document.getElementById('streamTitle').value || 'Untitled Stream';
-    try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        document.getElementById('localVideo').srcObject = localStream;
-        socket.emit('start_live_stream', { title: title });
-        document.getElementById('startBtn').style.display = 'none';
-        document.getElementById('stopBtn').style.display = 'inline-block';
-        document.getElementById('statusText').innerText = '🔴 LIVE: ' + title;
-    } catch (err) {
-        alert('Could not access camera: ' + err.message);
+    if (!localStream) {
+        await requestMediaAccess();
+        if (!localStream) return;
     }
+    socket.emit('start_live_stream', { title: title });
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display = 'inline-block';
+    document.getElementById('statusText').innerText = '🔴 LIVE: ' + title;
 };
 
 document.getElementById('stopBtn').onclick = () => {
@@ -2153,6 +3016,22 @@ socket.on('webrtc_signal', (data) => {
 socket.on('force_stream_end', () => {
     document.getElementById('stopBtn').click();
 });
+
+// Auto-check on load
+(async function init() {
+    if (!isSecure()) {
+        document.getElementById('secureWarning').style.display = 'block';
+        return;
+    }
+    const perms = await queryPermissions();
+    if (perms && (perms.camera === 'granted' && perms.microphone === 'granted')) {
+        await requestMediaAccess();
+    } else if (perms && (perms.camera === 'prompt' || perms.microphone === 'prompt')) {
+        // wait for user gesture
+    } else {
+        document.getElementById('permWarning').style.display = 'block';
+    }
+})();
 </script>
 {% endblock %}
     """,
@@ -2162,6 +3041,9 @@ socket.on('force_stream_end', () => {
 <div style="max-width: 800px; margin: auto; text-align: center;">
     <h2>📺 Watching {{ broadcaster }}</h2>
     <div class="admin-panel">
+        <div id="secureWarning" style="display:none; background:#ffebee; color:#c62828; padding:12px; border-radius:6px; margin-bottom:15px; font-size:13px; font-weight:bold; text-align:left;">
+            ❌ <b>Insecure Context</b> — Live streams require HTTPS or localhost. Please switch to a secure connection.
+        </div>
         <video id="remoteVideo" autoplay playsinline style="width: 100%; max-width: 600px; background: #000; border-radius: 8px;"></video>
         <p id="statusText" style="color: #888; margin-top: 10px;">Connecting to stream...</p>
     </div>
@@ -2172,24 +3054,33 @@ const broadcaster = '{{ broadcaster }}';
 let pc = null;
 const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-socket.on('connect', () => {
-    socket.emit('join_live_stream', { broadcaster: broadcaster });
-});
+function isSecure() {
+    return window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+}
 
-socket.on('webrtc_signal', (data) => {
-    if (!pc) createPeerConnection();
-    if (data.sdp) {
-        pc.setRemoteDescription(new RTCSessionDescription(data.sdp)).then(() => {
-            if (data.sdp.type === 'offer') {
-                pc.createAnswer().then(answer => {
-                    pc.setLocalDescription(answer);
-                    socket.emit('webrtc_signal', { target: data.sender, sdp: answer });
-                });
-            }
-        });
-    }
-    if (data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-});
+if (!isSecure()) {
+    document.getElementById('secureWarning').style.display = 'block';
+    document.getElementById('statusText').innerText = 'Connection blocked: insecure context. Use HTTPS or localhost.';
+} else {
+    socket.on('connect', () => {
+        socket.emit('join_live_stream', { broadcaster: broadcaster });
+    });
+
+    socket.on('webrtc_signal', (data) => {
+        if (!pc) createPeerConnection();
+        if (data.sdp) {
+            pc.setRemoteDescription(new RTCSessionDescription(data.sdp)).then(() => {
+                if (data.sdp.type === 'offer') {
+                    pc.createAnswer().then(answer => {
+                        pc.setLocalDescription(answer);
+                        socket.emit('webrtc_signal', { target: data.sender, sdp: answer });
+                    });
+                }
+            });
+        }
+        if (data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+    });
+}
 
 function createPeerConnection() {
     pc = new RTCPeerConnection(rtcConfig);
@@ -2244,7 +3135,7 @@ function createPeerConnection() {
         {% for n in notifications %}
         <a href="{{ n.link }}" style="text-decoration: none; color: inherit;">
             <div style="padding: 15px; border-radius: 8px; border-left: 4px solid {% if not n.read %}#065fd4{% else %}#ccc{% endif %}; background: {% if not n.read %}rgba(6, 95, 212, 0.08){% else %}transparent{% endif %};">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 5px;">
                     <div>
                         <span style="font-weight: bold; font-size: 14px;">{{ n.message }}</span>
                         {% if n.sender %}<span style="font-size: 12px; color: #888; margin-left: 8px;">from {{ n.sender }}</span>{% endif %}
@@ -2386,11 +3277,11 @@ async function askPermission() {
         <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
             <div style="flex: 1; min-width: 250px;">
                 <label style="font-size: 12px; font-weight: bold;">Blocked IPs (one per line)</label>
-                <textarea name="blocked_ips" rows="4" placeholder="192.168.1.1\\n10.0.0.5">{{ config.blocked_ips | join('\\n') }}</textarea>
+                <textarea name="blocked_ips" rows="4" placeholder="192.168.1.1\n10.0.0.5">{{ config.blocked_ips | join('\n') }}</textarea>
             </div>
             <div style="flex: 1; min-width: 250px;">
                 <label style="font-size: 12px; font-weight: bold;">Allowed IPs (one per line)</label>
-                <textarea name="allowed_ips" rows="4" placeholder="192.168.1.100\\n10.0.0.1">{{ config.allowed_ips | join('\\n') }}</textarea>
+                <textarea name="allowed_ips" rows="4" placeholder="192.168.1.100\n10.0.0.1">{{ config.allowed_ips | join('\n') }}</textarea>
             </div>
         </div>
         <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; cursor: pointer; margin-bottom: 15px;">
@@ -2459,7 +3350,7 @@ async function askPermission() {
             {% endfor %}
         </table>
     </div>
-    <div style="display: flex; justify-content: center; align-items: center; gap: 15px; margin-top: 15px;">
+    <div style="display: flex; justify-content: center; align-items: center; gap: 15px; margin-top: 15px; flex-wrap: wrap;">
         {% if sessions_page > 1 %}
         <a href="?sessions_page={{ sessions_page - 1 }}" style="text-decoration: none; background: #555; color: white; padding: 6px 12px; border-radius: 4px; font-size: 13px; font-weight: bold;">← Prev</a>
         {% endif %}
@@ -2609,7 +3500,7 @@ function addHashtagToEdit(user) {
 <div class="admin-panel" style="max-width: 900px; margin: auto; padding: 20px;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
         <h2 style="margin: 0; font-size: 18px;">{{ video.title }}</h2>
-        <div style="display: flex; gap: 10px;">
+        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
             <button onclick="saveVideo('{{ video_id }}')" id="saveBtn" class="primary-btn" style="background: #2e7d32; font-size: 13px;">{% if is_saved %}✅ Saved{% else %}💾 Save{% endif %}</button>
             <button id="musicModeToggle" style="background: #ff9800; color: white; padding: 8px 15px; border-radius: 20px; border: none; cursor: pointer; font-weight: bold; font-size: 13px;">🎧 Music Mode: OFF</button>
         </div>
@@ -2624,14 +3515,14 @@ function addHashtagToEdit(user) {
         <audio id="audPlayer" controls style="width: 100%; max-width: 500px;"><source src="/media/{{ video.filename }}" type="video/mp4"></audio>
         <p style="color:#aaa; font-size:13px; margin-top:15px;">Background play enabled.</p>
     </div>
-    <div style="margin-top: 15px; display: flex; gap: 15px; align-items: center;">
+    <div style="margin-top: 15px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
         <a href="/user/{{ video.uploader }}" style="text-decoration:none;">
             <div class="avatar-container">
                 {% if uploader_pic %}<img src="/media/profiles/{{ uploader_pic }}" class="avatar">
                 {% else %}<div class="avatar">{{ video.uploader[0]|upper }}</div>{% endif %}
             </div>
         </a>
-        <div style="flex: 1;">
+        <div style="flex: 1; min-width: 200px;">
             <span class="tags">{{ video.hashtags }}</span>
             <p class="card-meta" style="font-weight: bold; margin-top: 5px;">
                 <a href="/user/{{ video.uploader }}" style="color:#065fd4; text-decoration:none;">{{ video.uploader }}</a> • {{ video.timestamp }}
@@ -2648,9 +3539,9 @@ function addHashtagToEdit(user) {
 
 <div class="admin-panel" style="max-width: 900px; margin: 20px auto; padding: 20px;">
     <h3>💬 Comments ({{ comments|length }})</h3>
-    <form method="POST" style="display:flex; gap:10px; margin-bottom: 30px;">
+    <form method="POST" style="display:flex; gap:10px; margin-bottom: 30px; flex-wrap: wrap;">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
-        <input type="text" name="comment_text" placeholder="Add a comment... (Use @username to mention!)" required style="margin:0; flex:1;">
+        <input type="text" name="comment_text" placeholder="Add a comment... (Use @username to mention!)" required style="margin:0; flex:1; min-width: 200px;">
         <button class="primary-btn" type="submit" style="margin:0;">Post</button>
     </form>
     <div>
@@ -2660,17 +3551,17 @@ function addHashtagToEdit(user) {
                 {% if c.user_pic %}<img src="/media/profiles/{{ c.user_pic }}" class="avatar">
                 {% else %}<div class="avatar">{{ c.user[0]|upper }}</div>{% endif %}
             </div>
-            <div style="flex:1;">
+            <div style="flex:1; min-width: 0;">
                 <a href="/user/{{ c.user }}" style="font-weight:bold; color:#065fd4; text-decoration:none;">{{ c.user }}</a><span style="font-size: 12px; color: #888; margin-left: 10px;">{{ c.timestamp }}</span>
-                <p style="margin: 5px 0;">{{ c.text }}</p>
+                <p style="margin: 5px 0; word-break: break-word;">{{ c.text }}</p>
                 <div style="display:flex; gap: 10px; align-items: center; margin-bottom: 10px;">
                     <button onclick="likeComment('{{ video_id }}', '{{ c.id }}')" style="background:none; border:none; color:#888; font-weight:bold; cursor:pointer; font-size:12px;">👍 <span id="like-count-{{ c.id }}">{{ c.likes|length if c.likes else 0 }}</span></button>
                     <button onclick="toggleReply('{{ c.id }}')" style="background:none; border:none; color:#888; font-weight:bold; cursor:pointer; font-size:12px;">💬 Reply</button>
                 </div>
-                <form id="reply-form-{{ c.id }}" method="POST" style="display:none; gap:10px; margin-bottom: 15px;">
+                <form id="reply-form-{{ c.id }}" method="POST" style="display:none; gap:10px; margin-bottom: 15px; flex-wrap: wrap;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
                     <input type="hidden" name="parent_id" value="{{ c.id }}">
-                    <input type="text" name="comment_text" placeholder="Reply to {{ c.user }}..." required style="margin:0; flex:1; padding: 8px; font-size: 13px;">
+                    <input type="text" name="comment_text" placeholder="Reply to {{ c.user }}..." required style="margin:0; flex:1; padding: 8px; font-size: 13px; min-width: 150px;">
                     <button class="primary-btn" type="submit" style="margin:0; padding: 8px 12px; font-size: 13px;">Reply</button>
                 </form>
                 {% if c.replies %}
@@ -2681,9 +3572,9 @@ function addHashtagToEdit(user) {
                             {% if r.user_pic %}<img src="/media/profiles/{{ r.user_pic }}" class="avatar" style="width:25px; height:25px; font-size:12px;">
                             {% else %}<div class="avatar" style="width:25px; height:25px; font-size:12px;">{{ r.user[0]|upper }}</div>{% endif %}
                         </div>
-                        <div>
+                        <div style="min-width: 0;">
                             <a href="/user/{{ r.user }}" style="font-weight:bold; color:#065fd4; text-decoration:none;">{{ r.user }}</a><span style="font-size: 12px; color: #888; margin-left: 10px;">{{ r.timestamp }}</span>
-                            <p style="margin: 5px 0;">{{ r.text }}</p>
+                            <p style="margin: 5px 0; word-break: break-word;">{{ r.text }}</p>
                             <button onclick="likeComment('{{ video_id }}', '{{ r.id }}')" style="background:none; border:none; color:#888; font-weight:bold; cursor:pointer; font-size:12px;">👍 <span id="like-count-{{ r.id }}">{{ r.likes|length if r.likes else 0 }}</span></button>
                         </div>
                     </div>
@@ -2700,8 +3591,8 @@ function addHashtagToEdit(user) {
     <div style="background:white; padding:25px; border-radius:12px; max-width:400px; width:90%;" class="dark-box">
         <h3 style="margin-top:0;">➕ Add to Playlist</h3>
         <div id="playlistList" style="max-height: 200px; overflow-y: auto; margin-bottom: 15px;"></div>
-        <div style="display:flex; gap:10px;">
-            <input type="text" id="newPlaylistName" placeholder="New playlist name..." style="flex:1; margin:0;">
+        <div style="display:flex; gap:10px; flex-wrap: wrap;">
+            <input type="text" id="newPlaylistName" placeholder="New playlist name..." style="flex:1; margin:0; min-width: 150px;">
             <button onclick="createPlaylist()" class="primary-btn" style="margin:0;">Create</button>
         </div>
         <button onclick="closePlaylistModal()" style="margin-top:15px; width:100%; background:#888; color:white; border:none; padding:8px; border-radius:6px; cursor:pointer;">Cancel</button>
@@ -2810,7 +3701,7 @@ function addHashtagToEdit(user) {
 {% extends 'base.html' %}
 {% block content %}
 <div style="max-width: 800px; margin: auto;">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px;">
         <h2>📂 My Playlists</h2>
         <button onclick="document.getElementById('createPlForm').style.display='block'" class="primary-btn">➕ New Playlist</button>
     </div>
@@ -2910,7 +3801,7 @@ function addHashtagToEdit(user) {
 {% extends 'base.html' %}
 {% block content %}
 <div style="max-width: 800px; margin: auto;">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 10px;">
         <h2>📜 Watch History</h2>
         <form method="POST" style="margin:0;">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
@@ -2922,9 +3813,9 @@ function addHashtagToEdit(user) {
     <div style="display: flex; flex-direction: column; gap: 12px;">
         {% for h in history %}
         <a href="/watch/{{ h.video_id }}" style="text-decoration: none; color: inherit;">
-            <div class="admin-panel" style="display: flex; gap: 15px; align-items: center; margin-bottom: 0;">
+            <div class="admin-panel" style="display: flex; gap: 15px; align-items: center; margin-bottom: 0; flex-wrap: wrap;">
                 <div class="thumbnail" style="width: 160px; height: 90px; flex-shrink: 0; border-radius: 8px;">▶</div>
-                <div style="flex: 1;">
+                <div style="flex: 1; min-width: 200px;">
                     <div style="font-weight: bold; font-size: 16px; margin-bottom: 5px;">{{ h.title }}</div>
                     <div style="color: #888; font-size: 13px;">{{ h.uploader }} • Watched {{ h.watched_at }}</div>
                 </div>
@@ -2960,9 +3851,9 @@ function addHashtagToEdit(user) {
     <div style="display: flex; flex-direction: column; gap: 12px;">
         {% for h in history %}
         <a href="/watch/{{ h.video_id }}" style="text-decoration: none; color: inherit;">
-            <div class="admin-panel" style="display: flex; gap: 15px; align-items: center; margin-bottom: 0;">
+            <div class="admin-panel" style="display: flex; gap: 15px; align-items: center; margin-bottom: 0; flex-wrap: wrap;">
                 <div class="thumbnail" style="width: 160px; height: 90px; flex-shrink: 0; border-radius: 8px;">▶</div>
-                <div style="flex: 1;">
+                <div style="flex: 1; min-width: 200px;">
                     <div style="font-weight: bold; font-size: 16px; margin-bottom: 5px;">{{ h.title }}</div>
                     <div style="color: #888; font-size: 13px;">{{ h.uploader }} • Watched {{ h.watched_at }}</div>
                 </div>
