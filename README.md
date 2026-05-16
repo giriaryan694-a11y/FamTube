@@ -7,7 +7,7 @@
 ## ✨ Features
 
 ### 📹 Video Sharing
-- Upload videos in **MP4, WEBM, or OGG** format (up to 500MB)
+- Upload videos in **MP4, WEBM, or OGG** format 
 - Add **titles, captions, and hashtags** for easy discovery
 - **Privacy controls**: Public or Private videos with allowed user lists
 - **Magic byte validation** to prevent fake file uploads
