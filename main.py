@@ -24,7 +24,7 @@ app.permanent_session_lifetime = datetime.timedelta(days=365)
 app.config['SESSION_COOKIE_HTTPONLY'] = True  
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax' 
 app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production with HTTPS
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
+# MAX_CONTENT_LENGTH is set dynamically from admin config below
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"], storage_uri="memory://")
 csrf = CSRFProtect(app)
@@ -177,6 +177,24 @@ def revoke_all_user_sessions(username):
         del sessions[sid]
     save_json(SESSIONS_FILE, sessions)
 
+def get_max_upload_bytes():
+    """Convert admin upload limit config to bytes. 0 = unlimited."""
+    config = load_json(CONFIG_FILE)
+    size = config.get('max_upload_size', 1)
+    unit = config.get('max_upload_unit', 'GB')
+    if size == 0:
+        return 0
+    multipliers = {'MB': 1024*1024, 'GB': 1024*1024*1024, 'TB': 1024*1024*1024*1024}
+    return size * multipliers.get(unit, 1024*1024*1024)
+
+def update_max_content_length():
+    """Apply admin upload limit to Flask config."""
+    max_bytes = get_max_upload_bytes()
+    if max_bytes == 0:
+        app.config['MAX_CONTENT_LENGTH'] = None
+    else:
+        app.config['MAX_CONTENT_LENGTH'] = max_bytes
+
 # ==================== SECURITY MIDDLEWARE ====================
 
 @app.before_request
@@ -247,8 +265,11 @@ def init_db(filepath, default_data):
         with open(filepath, 'w', encoding='utf-8') as f: 
             json.dump(default_data, f, indent=4)
 
-init_db(CONFIG_FILE, {"allowed_ips": [], "blocked_ips": [], "strict_allowlist_mode": False, "ip_filter_enabled": False})
+init_db(CONFIG_FILE, {"allowed_ips": [], "blocked_ips": [], "strict_allowlist_mode": False, "ip_filter_enabled": False, "max_upload_size": 1, "max_upload_unit": "GB"})
 init_db(USERS_FILE, {})
+
+# Apply dynamic upload limit from config
+update_max_content_length()
 
 users_db = load_json(USERS_FILE)
 if not any(u.get('role') == 'admin' for u in users_db.values()):
@@ -312,6 +333,34 @@ def index():
             subscribed_content.append(v)
         else:
             feed_videos.append(v)
+
+    # Apply feed preference filter to general feed (OR logic: any match)
+    current_user_data = users.get(current_user, {})
+    feed_pref = current_user_data.get('feed_preference', 'all')
+    if feed_pref and feed_pref.lower() != 'all':
+        pref_tags = []
+        for tag in re.split(r'[,\s]+', feed_pref):
+            tag = tag.strip().lower()
+            if tag.startswith('#'):
+                tag = tag[1:]
+            if tag:
+                pref_tags.append(tag)
+        if pref_tags:
+            filtered_feed = []
+            for v in feed_videos:
+                vid_hashtags = v.get('hashtags', '').lower()
+                vid_tag_set = set()
+                for t in vid_hashtags.split():
+                    t = t.strip().strip('#')
+                    if t:
+                        vid_tag_set.add(t)
+                for t in vid_hashtags.split(','):
+                    t = t.strip().strip('#')
+                    if t:
+                        vid_tag_set.add(t)
+                if any(tag in vid_tag_set for tag in pref_tags):
+                    filtered_feed.append(v)
+            feed_videos = filtered_feed
 
     feed_videos.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     subscribed_content.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
@@ -482,6 +531,25 @@ def upload():
             return redirect(url_for('upload'))
 
         if file and allowed_file(file.filename, ALLOWED_EXTENSIONS):
+            # Check admin-configured max upload size before saving
+            file.seek(0, os.SEEK_END)
+            file_size = file.tell()
+            file.seek(0)
+            max_bytes = get_max_upload_bytes()
+            if max_bytes > 0 and file_size > max_bytes:
+                users = load_json(USERS_FILE)
+                unread = sum(1 for n in load_json(NOTIFS_FILE).get(session['username'], []) if not n.get('read'))
+                config = load_json(CONFIG_FILE)
+                m_size = config.get('max_upload_size', 1)
+                m_unit = config.get('max_upload_unit', 'GB')
+                limit_str = f"{m_size} {m_unit}" if m_size > 0 else "Unlimited"
+                return render_template('upload.html', 
+                                     error_msg=f"File too large. Maximum allowed size is {limit_str}.",
+                                     unread_notifs=unread,
+                                     current_user_obj=users.get(session['username'], {}),
+                                     max_upload_size=m_size,
+                                     max_upload_unit=m_unit)
+
             filename = secure_filename(file.filename)
             unique_name = f"{uuid.uuid4().hex}_{filename}"
             filepath = os.path.join(VIDEO_DIR, unique_name)
@@ -492,10 +560,15 @@ def upload():
                 os.remove(filepath)
                 users = load_json(USERS_FILE)
                 unread = sum(1 for n in load_json(NOTIFS_FILE).get(session['username'], []) if not n.get('read'))
+                config = load_json(CONFIG_FILE)
+                m_size = config.get('max_upload_size', 1)
+                m_unit = config.get('max_upload_unit', 'GB')
                 return render_template('upload.html', 
                                      error_msg="Invalid video file content.",
                                      unread_notifs=unread,
-                                     current_user_obj=users.get(session['username'], {}))
+                                     current_user_obj=users.get(session['username'], {}),
+                                     max_upload_size=m_size,
+                                     max_upload_unit=m_unit)
 
             title = request.form.get('title', 'Untitled').strip()
             captions = request.form.get('captions', '').strip()
@@ -530,11 +603,16 @@ def upload():
     current_user_obj = users.get(session.get('username'), {})
     notifs = load_json(NOTIFS_FILE).get(session.get('username'), [])
     unread = sum(1 for n in notifs if not n.get('read'))
+    config = load_json(CONFIG_FILE)
+    m_size = config.get('max_upload_size', 1)
+    m_unit = config.get('max_upload_unit', 'GB')
 
     return render_template('upload.html', 
                          unread_notifs=unread,
                          current_user_obj=current_user_obj,
-                         error_msg=None)
+                         error_msg=None,
+                         max_upload_size=m_size,
+                         max_upload_unit=m_unit)
 
 @app.route('/watch/<video_id>', methods=['GET', 'POST'])
 @login_required
@@ -1044,6 +1122,23 @@ def admin_dashboard():
             config['allowed_ips'] = [ip.strip() for ip in request.form.get('allowed_ips', '').split('\n') if ip.strip()]
             save_json(CONFIG_FILE, config)
             log_activity('update_ip_filter', session['username'])
+
+        elif action == 'update_upload_settings':
+            try:
+                size = int(request.form.get('max_upload_size', 1))
+                if size < 0:
+                    size = 0
+            except ValueError:
+                size = 1
+            unit = request.form.get('max_upload_unit', 'GB')
+            if unit not in ['MB', 'GB', 'TB']:
+                unit = 'GB'
+            config['max_upload_size'] = size
+            config['max_upload_unit'] = unit
+            save_json(CONFIG_FILE, config)
+            update_max_content_length()
+            log_activity('update_upload_settings', session['username'])
+            return redirect(url_for('admin_dashboard', msg='Upload settings updated successfully', msg_type='success'))
 
         elif action == 'kill_stream':
             target = request.form.get('target_user')
@@ -1558,6 +1653,30 @@ templates = {
             display: flex; 
             flex-direction: column; 
             -webkit-tap-highlight-color: transparent;
+        }
+
+        /* YouTube-style upload progress bar */
+        #yt-progress-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: #ff0000;
+            width: 0%;
+            z-index: 10000;
+            display: none;
+            box-shadow: 0 0 10px rgba(255,0,0,0.5);
+            transition: width 0.2s ease-out;
+        }
+        #yt-progress-bar.indeterminate {
+            background: linear-gradient(90deg, #ff0000 0%, #ff4444 50%, #ff0000 100%);
+            background-size: 200% 100%;
+            animation: yt-indeterminate 1.5s infinite linear;
+            width: 40% !important;
+        }
+        @keyframes yt-indeterminate {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(250%); }
         }
 
         /* Navbar - Enhanced for all screens */
@@ -2422,6 +2541,8 @@ templates = {
     </div>
     {% endif %}
 
+    <div id="yt-progress-bar"></div>
+
     <div class="navbar">
         <div style="display: flex; align-items: center;">
             {% if session.username %}<button style="background:none;border:none;font-size:24px;cursor:pointer;margin-right:10px;" onclick="toggleSidebar()">≡</button>{% endif %}
@@ -2496,6 +2617,7 @@ templates = {
             if(btn && document.documentElement.classList.contains('dark-mode')) btn.innerText = '☀️';
         })();
     </script>
+
 </body>
 </html>
     """,
@@ -2708,7 +2830,10 @@ templates = {
     <div style="background: #ffebee; color: #c62828; padding: 12px; border-radius: 6px; margin-bottom: 15px; font-weight: bold;">{{ error_msg }}</div>
     {% endif %}
     <div class="admin-panel">
-        <form method="POST" enctype="multipart/form-data">
+        <p style="font-size: 13px; color: #888; margin-bottom: 15px;">
+            📎 Max file size: {% if max_upload_size == 0 %}Unlimited{% else %}{{ max_upload_size }} {{ max_upload_unit }}{% endif %} • MP4, WEBM, OGG
+        </p>
+        <form id="uploadForm" method="POST" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
             <label style="font-size: 12px; font-weight: bold;">Video File (MP4, WEBM, OGG)</label>
             <input type="file" name="video_file" accept="video/*" required style="padding: 8px;">
@@ -2725,10 +2850,78 @@ templates = {
             </select>
             <label style="font-size: 12px; font-weight: bold;">Allowed Users (comma-separated, for private videos)</label>
             <input type="text" name="allowed_users" placeholder="user1, user2, user3">
-            <button class="primary-btn" type="submit" style="width: 100%; margin-top: 10px;">Upload Video</button>
+            <button id="uploadBtn" class="primary-btn" type="submit" style="width: 100%; margin-top: 10px;">Upload Video</button>
         </form>
+        <div id="uploadStatus" style="display:none; margin-top:15px; text-align:center; color:#666; font-size:14px; font-weight:bold;">
+            <div id="uploadPercent">Uploading 0%</div>
+            <div style="font-size:12px; color:#888; margin-top:4px;">Please keep this page open</div>
+        </div>
     </div>
 </div>
+
+<script>
+document.getElementById('uploadForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const form = this;
+    const btn = document.getElementById('uploadBtn');
+    const statusDiv = document.getElementById('uploadStatus');
+    const percentDiv = document.getElementById('uploadPercent');
+    const progressBar = document.getElementById('yt-progress-bar');
+    
+    const fileInput = form.querySelector('input[type="file"]');
+    if (!fileInput.files.length) return;
+    
+    btn.disabled = true;
+    btn.innerText = 'Uploading...';
+    statusDiv.style.display = 'block';
+    progressBar.style.display = 'block';
+    progressBar.classList.remove('indeterminate');
+    progressBar.style.width = '0%';
+    
+    const formData = new FormData(form);
+    const xhr = new XMLHttpRequest();
+    
+    xhr.upload.addEventListener('progress', function(e) {
+        if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            progressBar.style.width = percent + '%';
+            percentDiv.innerText = 'Uploading ' + percent + '%';
+        }
+    });
+    
+    xhr.addEventListener('load', function() {
+        progressBar.style.width = '100%';
+        if (xhr.status >= 200 && xhr.status < 300) {
+            progressBar.classList.add('indeterminate');
+            percentDiv.innerText = 'Processing...';
+            if (xhr.responseURL && xhr.responseURL !== window.location.href) {
+                window.location.href = xhr.responseURL;
+            } else {
+                document.open();
+                document.write(xhr.responseText);
+                document.close();
+            }
+        } else {
+            progressBar.style.display = 'none';
+            document.open();
+            document.write(xhr.responseText);
+            document.close();
+        }
+    });
+    
+    xhr.addEventListener('error', function() {
+        progressBar.style.display = 'none';
+        btn.disabled = false;
+        btn.innerText = 'Upload Video';
+        statusDiv.style.display = 'none';
+        alert('Upload failed. Please check your connection and try again.');
+    });
+    
+    xhr.open('POST', window.location.href);
+    xhr.setRequestHeader('X-CSRFToken', document.querySelector('meta[name="csrf-token"]').getAttribute('content'));
+    xhr.send(formData);
+});
+</script>
 {% endblock %}
     """,
     "search.html": """
@@ -2776,7 +2969,6 @@ templates = {
 {% endif %}
 {% endblock %}
     """,
-
     "profile.html": """
 {% extends 'base.html' %}
 {% block content %}
@@ -3253,7 +3445,6 @@ async function askPermission() {
 </script>
 {% endblock %}
     """,
-
     "admin.html": """
 {% extends 'base.html' %}
 {% block content %}
@@ -3277,11 +3468,11 @@ async function askPermission() {
         <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
             <div style="flex: 1; min-width: 250px;">
                 <label style="font-size: 12px; font-weight: bold;">Blocked IPs (one per line)</label>
-                <textarea name="blocked_ips" rows="4" placeholder="192.168.1.1\n10.0.0.5">{{ config.blocked_ips | join('\n') }}</textarea>
+                <textarea name="blocked_ips" rows="4" placeholder="192.168.1.1\\n10.0.0.5">{{ config.blocked_ips | join('\\n') }}</textarea>
             </div>
             <div style="flex: 1; min-width: 250px;">
                 <label style="font-size: 12px; font-weight: bold;">Allowed IPs (one per line)</label>
-                <textarea name="allowed_ips" rows="4" placeholder="192.168.1.100\n10.0.0.1">{{ config.allowed_ips | join('\n') }}</textarea>
+                <textarea name="allowed_ips" rows="4" placeholder="192.168.1.100\\n10.0.0.1">{{ config.allowed_ips | join('\\n') }}</textarea>
             </div>
         </div>
         <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; cursor: pointer; margin-bottom: 15px;">
@@ -3296,6 +3487,37 @@ async function askPermission() {
         • <b>ON (Blocklist):</b> Block listed IPs, allow all others<br>
         • <b>ON + Strict:</b> Only allow listed IPs, block all others
     </div>
+</div>
+
+<div class="admin-panel" style="border-left: 5px solid #065fd4; margin-bottom: 20px;">
+    <h3>📤 Upload Settings</h3>
+    <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+        <input type="hidden" name="action" value="update_upload_settings"/>
+        <div style="display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+                <label style="font-size: 12px; font-weight: bold;">Max Upload Size</label>
+                <input type="number" name="max_upload_size" value="{{ config.get('max_upload_size', 1) }}" min="0" step="1" style="margin: 5px 0 0 0;">
+            </div>
+            <div style="min-width: 120px;">
+                <label style="font-size: 12px; font-weight: bold;">Unit</label>
+                <select name="max_upload_unit" style="margin: 5px 0 0 0;">
+                    <option value="MB" {% if config.get('max_upload_unit') == 'MB' %}selected{% endif %}>MB</option>
+                    <option value="GB" {% if config.get('max_upload_unit', 'GB') == 'GB' %}selected{% endif %}>GB</option>
+                    <option value="TB" {% if config.get('max_upload_unit') == 'TB' %}selected{% endif %}>TB</option>
+                </select>
+            </div>
+        </div>
+        <p style="font-size: 13px; color: #888; margin: 10px 0 15px 0;">
+            Set to <b>0</b> for unlimited file size. Current limit: 
+            {% if config.get('max_upload_size', 1) == 0 %}
+                <b style="color: #4CAF50;">Unlimited</b>
+            {% else %}
+                <b>{{ config.get('max_upload_size', 1) }} {{ config.get('max_upload_unit', 'GB') }}</b>
+            {% endif %}
+        </p>
+        <button class="primary-btn" type="submit" style="width: 100%;">💾 Save Upload Settings</button>
+    </form>
 </div>
 
 <div class="admin-panel" style="border-left: 5px solid #d32f2f; margin-bottom: 20px;">
@@ -3384,10 +3606,8 @@ async function askPermission() {
             <input type="hidden" name="action" value="create_user"/>
             <input type="text" name="new_user" placeholder="New Username" required/>
             <input type="password" name="new_pass" placeholder="Password" required/>
-            <div style="display: flex; gap: 5px; align-items: center; margin: 5px 0;">
-                <input type="text" id="newPrefInput" name="preference" placeholder="Click # button to add tags" required style="flex:1; margin:0; background:#f5f5f5;" readonly onkeydown="return false;"/>
-                <button type="button" onclick="addHashtagToNew()" style="background:#065fd4; color:white; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">#</button>
-            </div>
+            <label style="font-size:12px; font-weight:bold;">Content Filter (e.g. #all or #edu, #all, #lol)</label>
+            <input type="text" name="preference" placeholder="#all or #edu, #all, #lol" value="">
             <button class="primary-btn" type="submit" style="width: 100%;">+ Create User</button>
         </form>
         <hr style="border-color: #ddd; margin: 20px 0;">
@@ -3397,7 +3617,7 @@ async function askPermission() {
             <tr>
                 <td><b>{{u}}</b></td><td>{{data.feed_preference}}</td>
                 <td>
-                    <button onclick="document.getElementById('edit-{{u}}').style.display='block'" style="background:#555; color: white; border: none; padding: 5px 10px; font-size:12px; border-radius: 4px; cursor: pointer;">Edit</button>
+                    <button onclick="document.getElementById('edit-{{u}}').style.display='block'; " style="background:#555; color: white; border: none; padding: 5px 10px; font-size:12px; border-radius: 4px; cursor: pointer;">Edit</button>
                     {% if data.role != 'admin' %}
                     <button onclick="document.getElementById('del-{{u}}').style.display='block'" style="background:#c62828; color: white; border: none; padding: 5px 10px; font-size:12px; border-radius: 4px; cursor: pointer;">Del</button>
                     {% endif %}
@@ -3415,11 +3635,8 @@ async function askPermission() {
                             <input type="text" name="edit_username" value="{{u}}" required>
                             <label style="font-size:12px; font-weight:bold;">New Password</label>
                             <input type="password" name="edit_password" placeholder="Leave blank to keep current password">
-                            <label style="font-size:12px; font-weight:bold;">Content Filter (hashtags comma-separated, or 'all')</label>
-                            <div style="display: flex; gap: 5px; align-items: center; margin: 5px 0;">
-                                <input type="text" id="editPref-{{u}}" name="edit_preference" value="{{data.feed_preference}}" required style="flex:1; margin:0; background:#f5f5f5;" readonly onkeydown="return false;">
-                                <button type="button" onclick="addHashtagToEdit('{{u}}')" style="background:#065fd4; color:white; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">#</button>
-                            </div>
+                            <label style="font-size:12px; font-weight:bold;">Content Filter (e.g. #all or #edu, #all, #lol)</label>
+                            <input type="text" name="edit_preference" value="{{ data.feed_preference }}">
                             <div style="margin-top: 10px;">
                                 <button type="submit" style="background:#2e7d32; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer;">Save Changes</button>
                                 <button type="button" onclick="document.getElementById('edit-{{u}}').style.display='none'" style="background:#777; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer;">Cancel</button>
@@ -3464,34 +3681,7 @@ async function askPermission() {
     </div>
 </div>
 
-<script>
-function addHashtagToNew() {
-    const input = document.getElementById('newPrefInput');
-    const val = input.value.trim();
-    const tags = val ? val.split(',').map(t => t.trim()).filter(t => t) : [];
-    const newTag = prompt('Enter hashtag (without #):');
-    if (newTag && newTag.trim()) {
-        const cleanTag = newTag.trim().replace(/^#/, '');
-        if (!tags.includes(cleanTag)) {
-            tags.push(cleanTag);
-        }
-        input.value = tags.join(', ');
-    }
-}
-function addHashtagToEdit(user) {
-    const input = document.getElementById('editPref-' + user);
-    const val = input.value.trim();
-    const tags = val ? val.split(',').map(t => t.trim()).filter(t => t) : [];
-    const newTag = prompt('Enter hashtag (without #):');
-    if (newTag && newTag.trim()) {
-        const cleanTag = newTag.trim().replace(/^#/, '');
-        if (!tags.includes(cleanTag)) {
-            tags.push(cleanTag);
-        }
-        input.value = tags.join(', ');
-    }
-}
-</script>
+
 {% endblock %}
     """,
     "watch.html": """
@@ -3868,6 +4058,9 @@ function addHashtagToEdit(user) {
 {% endblock %}
     """
 }
+
+
+
 
 app.jinja_loader = DictLoader(templates)
 
