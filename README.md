@@ -44,7 +44,7 @@
 - **Activity Logging** — full audit trail of all actions
 
 ### 🎨 UI/UX
-- **Dark/Light mode** toggle with persistent cookie preference
+- **Light, Dark, and System themes** with a persistent cookie preference; theme selector is available on the login screen and authenticated pages, and System follows the device setting
 - **Responsive, YouTube-inspired interface** — adaptive navigation, searchable header, video grids, and comfortable layouts across mobile, tablet, and desktop
 - **Real-time notifications** via WebSocket with browser push support
 - **Sidebar navigation** for quick access to all sections
@@ -52,14 +52,14 @@
 
 ### 🧭 Interface and usability improvements
 - Desktop navigation stays visible with a collapsible sidebar; mobile navigation uses a bottom bar and an accessible slide-out menu.
-- Search can be opened directly from the mobile header, and the light/dark theme control is available from the main navigation.
+- Search can be opened directly from the mobile header, and the Light/Dark/System theme selector is available from the main navigation and the signed-out login header.
 - Video player sizing, cards, form controls, tables, and notifications adapt to narrow screens and respect device safe areas.
 - Private/hidden video media is checked at the media endpoint as well as in page listings, and video-related APIs validate access before updating saves, history, or engagement.
 
 ### 🔒 Security
 - **CSRF Protection** on all forms
 - **Rate Limiting** — 200/day, 50/hour default; 10/minute login; 10/hour upload
-- **Secure session cookies** (HttpOnly, SameSite=Lax)
+- **Secure session cookies** (HttpOnly, SameSite=Lax; Secure flag configurable for HTTPS)
 - **Path traversal prevention** on all file operations
 - **Content Security Policy (CSP)** via Flask-Talisman
 - **Password hashing** with Werkzeug
@@ -163,11 +163,14 @@ For production or network access, place FamTube behind a reverse proxy (Nginx, C
 ### Environment Variables
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `FAMTUBE_SECRET_KEY` | Flask session secret key | Auto-generated random |
+| `FAMTUBE_SECRET_KEY` | Stable Flask session/CSRF signing key. Strongly recommended in production. | Persistent local key file if unset |
+| `FAMTUBE_SECRET_KEY_FILE` | Optional path for the persistent local signing-key file. | `famtube_admin/.secret_key` |
+| `FAMTUBE_COOKIE_SECURE` | Set to `1`/`true` when served over HTTPS to mark session cookies Secure. | `0` for local HTTP development |
 
 ### File Storage (Auto-Created)
 ```
 famtube_admin/
+├── .secret_key      # Persistent local Flask session/CSRF signing key (keep private)
 ├── videos/          # Uploaded video files
 ├── profiles/        # Profile pictures
 ├── backups/         # User deletion backups
@@ -213,7 +216,7 @@ famtube_admin/
 | Component | Technology |
 |-----------|------------|
 | Backend | Python 3, Flask |
-| Real-time | Flask-SocketIO, WebRTC |
+| Real-time | Flask-SocketIO (threading mode), WebRTC |
 | Security | Flask-Talisman, Flask-Limiter, Flask-WTF, CSRFProtect |
 | Frontend | Vanilla HTML/CSS/JS (Jinja2 templates) |
 | Database | JSON file-based (no external DB required) |
@@ -223,12 +226,30 @@ famtube_admin/
 
 ## 🔐 Security Notes
 
-- **Always use HTTPS in production** — set `SESSION_COOKIE_SECURE = True` and `force_https=True` in Talisman
+- **Always use HTTPS in production** — set `FAMTUBE_COOKIE_SECURE=1` and configure Flask-Talisman HTTPS enforcement at the correctly configured reverse proxy/app boundary
+- **Debug mode is disabled by the normal launcher** (`debug=False`, `use_reloader=False`); do not enable the interactive debugger on a network-accessible deployment
+- **The built-in launcher is for local/small deployments**; use a production-capable deployment setup and valid TLS for internet-facing hosting
+- **Socket.IO explicitly uses `threading` mode** instead of auto-selecting Eventlet, avoiding the Eventlet deprecation warning. Install `simple-websocket` so threading mode can support WebSocket transport: `pip install simple-websocket`.
 - **Change the default admin password immediately**
-- **Set `FAMTUBE_SECRET_KEY`** to a fixed value in production to prevent session invalidation on restart
+- **Set `FAMTUBE_SECRET_KEY`** to a strong, stable secret in production and keep it identical across workers/instances. The development fallback is stored in `famtube_admin/.secret_key` so local restarts do not invalidate CSRF/session cookies. Back up and protect that file.
+- **Set `FAMTUBE_COOKIE_SECURE=1` on HTTPS deployments** so browsers only send the session cookie over HTTPS. The default is `0` for local plain-HTTP testing; never use that setting on an untrusted network or public deployment.
+- **CSRF troubleshooting:** do not disable CSRF protection. Load the form with GET first, preserve cookies, use the same hostname consistently (for example, do not switch between `localhost` and `127.0.0.1`), avoid caching HTML that contains CSRF tokens, and keep the signing key stable across restarts/instances. Talisman's default `session_cookie_secure=True` can cause the browser to withhold the cookie over plain HTTP; FamTube now passes the explicit `FAMTUBE_COOKIE_SECURE` policy to Talisman so local HTTP and HTTPS production setups behave deliberately. The signing key is persisted in `famtube_admin/.secret_key` if `FAMTUBE_SECRET_KEY` is not set, so restarts do not invalidate every session and CSRF token. A custom CSRF error page gives recovery guidance without disabling protection.
 - **IP Filtering** is disabled by default — enable it from the Admin Dashboard when needed
 - All file uploads are validated by **magic bytes**, not just extensions
 - For local WebRTC testing, use `http2https` or `localhost` to satisfy browser secure-context requirements
+
+---
+
+## 🧪 Testing
+
+Install the development/test dependencies and run the smoke suite:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q tests/
+```
+
+The integration tests run FamTube in temporary directories to avoid changing your real user/video data. They validate login CSRF handling, stable signing-key behavior across restarts, template compilation, and the selected Socket.IO mode.
 
 ---
 
