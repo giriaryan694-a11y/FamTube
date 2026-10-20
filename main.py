@@ -19,6 +19,9 @@ from flask_wtf.csrf import CSRFProtect
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
+# Never expose Werkzeug's interactive debugger or automatic reloader from the normal launcher.
+app.config['DEBUG'] = False
+app.config['TEMPLATES_AUTO_RELOAD'] = False
 app.secret_key = os.environ.get('FAMTUBE_SECRET_KEY', secrets.token_urlsafe(32))
 app.permanent_session_lifetime = datetime.timedelta(days=365)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
@@ -1057,10 +1060,37 @@ templates = {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
     <meta name="csrf-token" content="{{ csrf_token() }}">
-    <meta name="theme-color" content="#ff0000">
+    <meta name="theme-color" content="#ffffff" id="theme-color-meta">
     <title>FamTube</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.js"></script>
-    <script>function getCookie(n){let m=document.cookie.match(new RegExp('(^| )'+n+'=([^;]+)'));return m?m[2]:null;}if(getCookie('theme')==='dark')document.documentElement.classList.add('dark-mode');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b&&document.documentElement.classList.contains('dark-mode'))b.textContent='☀️';});</script>
+    <script>
+    /* Apply the theme before styles paint to avoid a light/dark flash. Supports old light/dark cookies. */
+    (function () {
+        function readCookie(name) {
+            const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+            return match ? decodeURIComponent(match[1]) : null;
+        }
+        const validThemes = ['light', 'dark', 'system'];
+        let preference = readCookie('theme');
+        if (!validThemes.includes(preference)) preference = 'system';
+        const systemPreference = window.matchMedia('(prefers-color-scheme: dark)');
+        function applyTheme(theme) {
+            const resolvedDark = theme === 'dark' || (theme === 'system' && systemPreference.matches);
+            document.documentElement.dataset.theme = theme;
+            document.documentElement.classList.toggle('dark-mode', resolvedDark);
+            const meta = document.getElementById('theme-color-meta');
+            if (meta) meta.content = resolvedDark ? '#0f0f0f' : '#ffffff';
+        }
+        window.famTubeThemePreference = preference;
+        window.applyFamTubeTheme = applyTheme;
+        applyTheme(preference);
+        const onSystemChange = function () {
+            if (window.famTubeThemePreference === 'system') applyTheme('system');
+        };
+        if (systemPreference.addEventListener) systemPreference.addEventListener('change', onSystemChange);
+        else if (systemPreference.addListener) systemPreference.addListener(onSystemChange);
+    })();
+    </script>
     <style>
         :root {
             --bg: #ffffff; --surface: #ffffff; --text: #0f0f0f; --text2: #606060;
@@ -1089,6 +1119,10 @@ templates = {
         .search-icon-mobile { display: none; font-size: 22px; color: var(--text); text-decoration: none; padding: 8px; }
         
         .icon-btn { background: none; border: none; font-size: 22px; cursor: pointer; padding: 8px; border-radius: 50%; color: var(--text); text-decoration: none; position: relative; display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; }
+        .theme-picker { width: auto; min-width: 112px; max-width: 132px; margin: 0; padding: 8px 10px; min-height: 38px; border-radius: 20px; background: var(--hover); color: var(--text); border: 1px solid var(--border); font-size: 14px; cursor: pointer; }
+        .public-header { min-height: 60px; padding: 10px clamp(14px, 4vw, 32px); display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
+        .public-header-actions { display: flex; align-items: center; gap: 8px; }
+        .public-header .theme-label { margin: 0; color: var(--text2); font-size: 13px; }
         .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--primary); display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; text-decoration: none; overflow: hidden; flex-shrink: 0; }
         .avatar-img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
         .badge { position: absolute; top: 2px; right: 2px; background: var(--accent); color: white; font-size: 10px; padding: 2px 5px; border-radius: 10px; font-weight: bold; }
@@ -1243,6 +1277,11 @@ templates = {
             .nav-right { gap: 1px; }
             .navbar .logo { font-size: 17px; gap: 2px; }
             .navbar .icon-btn { width: 36px; height: 36px; padding: 5px; font-size: 20px; }
+            .navbar .theme-picker { min-width: 88px; max-width: 92px; padding: 7px 4px; font-size: 12px; }
+            .public-header { padding-inline: 12px; }
+            .public-header .logo { font-size: 18px; }
+            .public-header .theme-label { display: none; }
+            .public-header .theme-picker { min-width: 94px; }
             .search-container { display: none; }
             .search-container.mobile-open {
                 display: flex; position: absolute; top: 60px; left: 10px; right: 10px; width: auto; max-width: none;
@@ -1277,6 +1316,7 @@ templates = {
         @media (max-width: 380px) {
             .navbar .logo { font-size: 15px; }
             .navbar .icon-btn { width: 32px; height: 34px; }
+            .navbar .theme-picker { min-width: 78px; max-width: 82px; padding: 6px 2px; font-size: 11px; }
             .navbar .nav-left .menu-toggle { width: 30px; }
             .nav-right { gap: 0; }
             .avatar { width: 29px; height: 29px; }
@@ -1289,6 +1329,19 @@ templates = {
     </style>
 </head>
 <body class="{% if session.username %}authenticated{% endif %}">
+{% if not session.username %}
+    <header class="public-header">
+        <a href="/login" class="logo"><span>▶</span> FamTube</a>
+        <div class="public-header-actions">
+            <label class="theme-label" for="publicThemeSelect">Theme</label>
+            <select id="publicThemeSelect" class="theme-picker theme-select" aria-label="Color theme" title="Color theme">
+                <option value="light">☀ Light</option>
+                <option value="dark">☾ Dark</option>
+                <option value="system">◐ System</option>
+            </select>
+        </div>
+    </header>
+{% endif %}
 {% if session.username %}
     <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
     <div class="sidebar" id="sidebar">
@@ -1324,7 +1377,11 @@ templates = {
         </div>
         <div class="nav-right">
             <button type="button" class="icon-btn search-icon-mobile" onclick="toggleMobileSearch()" aria-label="Open search">🔍</button>
-            <button type="button" class="icon-btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle light and dark theme" title="Toggle theme">🌙</button>
+            <select class="theme-picker theme-select" aria-label="Color theme" title="Color theme">
+                <option value="light">☀ Light</option>
+                <option value="dark">☾ Dark</option>
+                <option value="system">◐ System</option>
+            </select>
             <a href="/notifications" class="icon-btn" aria-label="Notifications">🔔<span class="badge" id="notif-badge" style="display:{% if unread_notifs > 0 %}flex{% else %}none{% endif %};">{{ unread_notifs }}</span></a>
             <a href="/user/{{ session.username }}" class="avatar">
                 {% if current_user_obj.get('profile_pic') %}<img src="/media/profiles/{{ current_user_obj.profile_pic }}" class="avatar-img">{% else %}{{ session.username[0]|upper }}{% endif %}
@@ -1395,17 +1452,18 @@ templates = {
             if (input) input.focus();
         }
     }
-    function toggleTheme() {
-        const html = document.documentElement;
-        html.classList.toggle('dark-mode');
-        const dark = html.classList.contains('dark-mode');
-        document.cookie = 'theme=' + (dark ? 'dark' : 'light') + ';path=/;max-age=31536000;SameSite=Lax';
-        const button = document.querySelector('.theme-toggle');
-        if (button) {
-            button.textContent = dark ? '☀️' : '🌙';
-            button.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
-        }
+    function setTheme(theme) {
+        if (!['light', 'dark', 'system'].includes(theme)) theme = 'system';
+        window.famTubeThemePreference = theme;
+        window.applyFamTubeTheme(theme);
+        const secureFlag = window.location.protocol === 'https:' ? ';Secure' : '';
+        document.cookie = 'theme=' + encodeURIComponent(theme) + ';path=/;max-age=31536000;SameSite=Lax' + secureFlag;
+        document.querySelectorAll('.theme-select').forEach((select) => { select.value = theme; });
     }
+    document.querySelectorAll('.theme-select').forEach((select) => {
+        select.value = window.famTubeThemePreference || 'system';
+        select.addEventListener('change', () => setTheme(select.value));
+    });
     window.addEventListener('resize', () => {
         const sidebar = document.getElementById('sidebar');
         const overlay = document.getElementById('overlay');
@@ -1883,4 +1941,4 @@ app.jinja_loader = DictLoader(templates)
 
 if __name__ == '__main__':
     threading.Thread(target=generate_missing_thumbnails, daemon=True).start()
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5000)
