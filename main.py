@@ -36,11 +36,12 @@ csp = {
     'media-src': ["'self'", "blob:"]
 }
 talisman = Talisman(app, content_security_policy=csp, force_https=False)
-socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=500000000)
+socketio = SocketIO(app, cors_allowed_origins=None, max_http_buffer_size=1_000_000)
 
 online_users = {}
 user_status = {}
 live_streams = {}
+stream_viewers = {}
 
 ADMIN_DIR = 'famtube_admin'
 VIDEO_DIR = os.path.join(ADMIN_DIR, 'videos')
@@ -121,10 +122,17 @@ def notify_user(target_username, message, link, sender=None):
         except Exception: pass
 
 def can_view_video(v, user, role):
-    if v.get('visibility') == 'hidden' and role != 'admin': return False
-    if v.get('privacy') == 'private' and role != 'admin' and user != v['uploader']:
-        allowed = [u.strip() for u in v.get('allowed_users', "").split(',') if u.strip()]
-        if user not in allowed: return False
+    """Return whether the current account may view a video's metadata and media."""
+    if not isinstance(v, dict):
+        return False
+    if v.get('visibility', 'visible') == 'hidden' and role != 'admin':
+        return False
+    uploader = v.get('uploader', '')
+    if v.get('privacy') == 'private' and role != 'admin' and user != uploader:
+        raw_allowed = v.get('allowed_users', '')
+        allowed = [name.strip() for name in raw_allowed.split(',') if name.strip()] if isinstance(raw_allowed, str) else []
+        if not user or user not in allowed:
+            return False
     return True
 
 def is_valid_username(username):
@@ -164,6 +172,84 @@ def update_max_content_length():
 
 def get_user_data(username): return load_json(USERS_FILE).get(username, {})
 def update_user_data(username, data): users = load_json(USERS_FILE); users[username] = data; save_json(USERS_FILE, users)
+
+def rename_user_references(old_username, new_username):
+    """Keep user-owned content and social references consistent after a rename."""
+    if not old_username or not new_username or old_username == new_username:
+        return
+
+    videos = load_json(VIDEOS_FILE)
+    for video in videos.values():
+        if video.get('uploader') == old_username:
+            video['uploader'] = new_username
+        allowed = video.get('allowed_users', '')
+        if isinstance(allowed, str) and allowed.strip():
+            names = [name.strip() for name in allowed.split(',') if name.strip()]
+            video['allowed_users'] = ', '.join(new_username if name == old_username else name for name in names)
+    save_json(VIDEOS_FILE, videos)
+
+    subscriptions = load_json(SUBS_FILE)
+    if old_username in subscriptions:
+        subscriptions[new_username] = subscriptions.pop(old_username)
+    for subscriber, followed_users in subscriptions.items():
+        if isinstance(followed_users, list):
+            subscriptions[subscriber] = [new_username if name == old_username else name for name in followed_users]
+    save_json(SUBS_FILE, subscriptions)
+
+    # These stores are keyed by the account name.
+    for filepath in (ENGAGE_FILE, SAVED_FILE, HISTORY_FILE, NOTIFS_FILE):
+        data = load_json(filepath)
+        if isinstance(data, dict) and old_username in data:
+            data[new_username] = data.pop(old_username)
+        if filepath == NOTIFS_FILE and isinstance(data, dict):
+            for notification_list in data.values():
+                if not isinstance(notification_list, list):
+                    continue
+                for notification in notification_list:
+                    if notification.get('sender') == old_username:
+                        notification['sender'] = new_username
+                    link = notification.get('link')
+                    if isinstance(link, str):
+                        notification['link'] = link.replace(f'/user/{old_username}', f'/user/{new_username}')
+        save_json(filepath, data)
+
+    playlists = load_json(PLAYLISTS_FILE)
+    for playlist in playlists.values():
+        if playlist.get('owner') == old_username:
+            playlist['owner'] = new_username
+    save_json(PLAYLISTS_FILE, playlists)
+
+    comments_db = load_json(COMMENTS_FILE)
+    def rename_comment_authors(items):
+        if not isinstance(items, list):
+            return
+        for comment in items:
+            if comment.get('user') == old_username:
+                comment['user'] = new_username
+            rename_comment_authors(comment.get('replies', []))
+    if isinstance(comments_db, dict):
+        for items in comments_db.values():
+            rename_comment_authors(items)
+    save_json(COMMENTS_FILE, comments_db)
+
+    sessions = load_json(SESSIONS_FILE)
+    for session_data in sessions.values():
+        if session_data.get('username') == old_username:
+            session_data['username'] = new_username
+    save_json(SESSIONS_FILE, sessions)
+
+    if old_username in online_users:
+        online_users[new_username] = online_users.pop(old_username)
+    if old_username in user_status:
+        user_status[new_username] = user_status.pop(old_username)
+    # End an existing stream cleanly; its old watch URL would otherwise become stale.
+    if old_username in live_streams:
+        live_streams.pop(old_username, None)
+        stream_viewers.pop(old_username, None)
+        try:
+            socketio.emit('stream_ended', {'broadcaster': old_username}, broadcast=True)
+        except Exception:
+            pass
 
 # ==================== SECURITY MIDDLEWARE ====================
 @app.before_request
@@ -221,12 +307,13 @@ for f, d in [(LOGS_FILE,[]), (VIDEOS_FILE,{}), (ENGAGE_FILE,{}), (COMMENTS_FILE,
     init_db(f, d)
 
 def get_all_hashtags():
-    videos = load_json(VIDEOS_FILE); hashtags = set()
-    for v in videos.values():
-        for tag in v.get('hashtags', '').split():
-            tag = tag.strip().lower()
-            if tag.startswith('#') and len(tag) > 1: hashtags.add(tag)
-    return sorted(list(hashtags))
+    videos = load_json(VIDEOS_FILE)
+    hashtags = set()
+    for video in videos.values():
+        raw_tags = video.get('hashtags', '')
+        if isinstance(raw_tags, str):
+            hashtags.update(tag.lower() for tag in re.findall(r'#[\w-]+', raw_tags))
+    return sorted(hashtags)
 
 # ==================== ROUTES ====================
 @app.route('/')
@@ -277,11 +364,12 @@ def logout():
     session.clear(); return redirect(url_for('login'))
 
 @app.route('/explore')
+@login_required
 def explore():
     videos = load_json(VIDEOS_FILE); users = load_json(USERS_FILE); current_user = session.get('username'); role = session.get('role')
     hashtags = get_all_hashtags(); tags_param = request.args.get('tags', '').strip()
     sort_mode = request.args.get('sort', 'latest')
-    selected_tags = [t.strip().lower() for t in tags_param.split(',') if t.strip()] if tags_param else []
+    selected_tags = [t.strip().lower().lstrip('#') for t in tags_param.split(',') if t.strip()] if tags_param else []
     comments_db = load_json(COMMENTS_FILE)
     filtered = []
     for vid, v in videos.items():
@@ -289,9 +377,12 @@ def explore():
         v['id'] = vid; v['thumbnail'] = v.get('thumbnail'); v['uploader_pic'] = users.get(v['uploader'], {}).get('profile_pic', '')
         v['comment_count'] = len(comments_db.get(vid, []))
         if selected_tags:
-            vid_tags = v.get('hashtags', '').lower()
-            if any('#'+tag in vid_tags or tag in vid_tags for tag in selected_tags): filtered.append(v)
-        else: filtered.append(v)
+            raw_tags = v.get('hashtags', '')
+            vid_tags = {tag.lower().lstrip('#') for tag in re.findall(r'#[\w-]+', raw_tags)} if isinstance(raw_tags, str) else set()
+            if vid_tags.intersection(selected_tags):
+                filtered.append(v)
+        else:
+            filtered.append(v)
 
     if sort_mode == 'discussed': filtered.sort(key=lambda x: x.get('comment_count', 0), reverse=True)
     else: filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
@@ -301,6 +392,7 @@ def explore():
     return render_template('explore.html', videos=filtered, hashtags=hashtags, selected_tags=selected_tags, sort_mode=sort_mode, all_videos_mode=not selected_tags, unread_notifs=unread, current_user_obj=current_user_obj)
 
 @app.route('/search')
+@login_required
 def search():
     query = request.args.get('q', '').strip(); current_user = session.get('username'); role = session.get('role')
     users = load_json(USERS_FILE); videos = load_json(VIDEOS_FILE); result_users = []; result_videos = []
@@ -322,6 +414,17 @@ def upload():
     if request.method == 'POST':
         if 'video_file' not in request.files: return redirect(url_for('upload'))
         file = request.files['video_file']
+        title = request.form.get('title', '').strip()[:180]
+        captions = request.form.get('captions', '').strip()[:10000]
+        hashtags = request.form.get('hashtags', '').strip()[:500]
+        privacy = request.form.get('privacy', 'public').strip().lower()
+        allowed_users = request.form.get('allowed_users', '').strip()[:1000]
+        if not title:
+            users = load_json(USERS_FILE)
+            current_user_obj = users.get(session.get('username'), {})
+            return render_template('upload.html', error_msg='A video title is required.', unread_notifs=0, current_user_obj=current_user_obj, max_upload_size=load_json(CONFIG_FILE).get('max_upload_size', 1), max_upload_unit=load_json(CONFIG_FILE).get('max_upload_unit', 'GB'))
+        if privacy not in ('public', 'private'):
+            privacy = 'public'
         if file.filename == '': return redirect(url_for('upload'))
         if file and allowed_file(file.filename, ALLOWED_EXTENSIONS):
             file.seek(0, os.SEEK_END); file_size = file.tell(); file.seek(0); max_bytes = get_max_upload_bytes()
@@ -343,7 +446,6 @@ def upload():
                     else: os.remove(thumb_path)
             if not thumbnail: thumbnail = generate_thumbnail(unique_name)
             
-            title = request.form.get('title', 'Untitled').strip(); captions = request.form.get('captions', '').strip(); hashtags = request.form.get('hashtags', '').strip(); privacy = request.form.get('privacy', 'public'); allowed_users = request.form.get('allowed_users', '').strip()
             videos = load_json(VIDEOS_FILE); video_id = str(uuid.uuid4())
             videos[video_id] = {'title': title, 'captions': captions, 'hashtags': hashtags, 'privacy': privacy, 'allowed_users': allowed_users, 'uploader': session['username'], 'filename': unique_name, 'thumbnail': thumbnail, 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 'visibility': 'visible'}
             save_json(VIDEOS_FILE, videos); subs = load_json(SUBS_FILE)
@@ -364,6 +466,7 @@ def watch(video_id):
     if request.method == 'POST':
         text = request.form.get('comment_text', '').strip(); parent_id = request.form.get('parent_id', '').strip()
         if text:
+            text = text[:2000]
             comment_id = str(uuid.uuid4()); comment_obj = {'id': comment_id, 'user': session['username'], 'text': text, 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 'likes': [], 'user_pic': users.get(session['username'], {}).get('profile_pic', '')}
             if video_id not in comments_db: comments_db[video_id] = []
             if parent_id:
@@ -418,7 +521,7 @@ def settings():
         action = request.form.get('action')
         if action == 'update_profile':
             bio = request.form.get('bio', '').strip()
-            if bio: user_data['bio'] = bio[:500]
+            user_data['bio'] = bio[:500]
             if 'profile_pic' in request.files:
                 file = request.files['profile_pic']
                 if file and file.filename and allowed_file(file.filename, ALLOWED_PICS):
@@ -429,17 +532,38 @@ def settings():
         elif action == 'toggle_privacy': user_data['hide_last_seen'] = request.form.get('hide_last_seen') == 'yes'; update_user_data(username, user_data); success_msg = "Privacy settings saved."
         elif action == 'toggle_device_notif': user_data['device_notif_enabled'] = request.form.get('device_notif') == 'yes'; update_user_data(username, user_data); success_msg = "Notification settings saved."
         elif action == 'change_creds':
-            new_username = request.form.get('new_username', '').strip(); new_password = request.form.get('new_password', '')
-            if new_username and new_username != username:
-                if not is_valid_username(new_username): error_msg = "Invalid username format."
-                elif new_username in users: error_msg = "Username already taken."
-                else: users[new_username] = user_data; del users[username]; save_json(USERS_FILE, users); session['username'] = new_username; username = new_username; success_msg = "Username updated."
-            if new_password and not error_msg:
-                if len(new_password) < 6: error_msg = "Password must be at least 6 characters."
+            new_username = request.form.get('new_username', '').strip()
+            new_password = request.form.get('new_password', '')
+            # Validate both requested changes before mutating either one.
+            if new_password and len(new_password) < 6:
+                error_msg = "Password must be at least 6 characters."
+            if not error_msg and new_username and new_username != username:
+                if not is_valid_username(new_username):
+                    error_msg = "Invalid username format."
+                elif new_username in users:
+                    error_msg = "Username already taken."
                 else:
-                    user_data['password_hash'] = generate_password_hash(new_password); update_user_data(username, user_data); revoke_all_user_sessions(username)
-                    sessions = load_json(SESSIONS_FILE); sessions[session['session_id']] = {'username': username, 'ip': request.remote_addr, 'user_agent': request.headers.get('User-Agent', ''), 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                    save_json(SESSIONS_FILE, sessions); success_msg = success_msg or "Password updated."
+                    old_username = username
+                    users[new_username] = user_data
+                    del users[old_username]
+                    save_json(USERS_FILE, users)
+                    rename_user_references(old_username, new_username)
+                    session['username'] = new_username
+                    username = new_username
+                    success_msg = "Username updated."
+            if new_password and not error_msg:
+                user_data['password_hash'] = generate_password_hash(new_password)
+                update_user_data(username, user_data)
+                revoke_all_user_sessions(username)
+                sessions = load_json(SESSIONS_FILE)
+                sessions[session['session_id']] = {
+                    'username': username,
+                    'ip': request.remote_addr,
+                    'user_agent': request.headers.get('User-Agent', ''),
+                    'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                save_json(SESSIONS_FILE, sessions)
+                success_msg = success_msg or "Password updated."
             log_activity('change_credentials', username)
             
     unread = 0; notifs = load_json(NOTIFS_FILE).get(username, []); unread = sum(1 for n in notifs if not n.get('read')); current_user_obj = users.get(username, {})
@@ -491,7 +615,12 @@ def playlist_detail(pl_id):
     if request.method == 'POST' and request.form.get('action') == 'delete_playlist': del playlists_db[pl_id]; save_json(PLAYLISTS_FILE, playlists_db); return redirect(url_for('playlists'))
     pl_videos = []
     for vid in pl.get('videos', []):
-        if vid in videos: v = videos[vid]; v['id'] = vid; v['thumbnail'] = v.get('thumbnail'); v['uploader_pic'] = users.get(v['uploader'], {}).get('profile_pic', ''); pl_videos.append(v)
+        if vid in videos and can_view_video(videos[vid], session.get('username'), session.get('role')):
+            v = videos[vid]
+            v['id'] = vid
+            v['thumbnail'] = v.get('thumbnail')
+            v['uploader_pic'] = users.get(v.get('uploader', ''), {}).get('profile_pic', '')
+            pl_videos.append(v)
     unread = 0; notifs = load_json(NOTIFS_FILE).get(session['username'], []); unread = sum(1 for n in notifs if not n.get('read')); current_user_obj = users.get(session['username'], {})
     return render_template('playlist_detail.html', playlist=pl, videos=pl_videos, unread_notifs=unread, current_user_obj=current_user_obj)
 
@@ -514,7 +643,9 @@ def watch_history():
     history_list = []
     for h in history_db.get(username, []):
         vid = h.get('video_id')
-        if vid and vid in videos: v = videos[vid]; history_list.append({'video_id': vid, 'title': v.get('title', 'Untitled'), 'uploader': v.get('uploader', 'Unknown'), 'watched_at': h.get('timestamp', ''), 'thumbnail': v.get('thumbnail')})
+        if vid and vid in videos and can_view_video(videos[vid], username, session.get('role')):
+            v = videos[vid]
+            history_list.append({'video_id': vid, 'title': v.get('title', 'Untitled'), 'uploader': v.get('uploader', 'Unknown'), 'watched_at': h.get('timestamp', ''), 'thumbnail': v.get('thumbnail')})
     history_list.reverse(); unread = 0; notifs = load_json(NOTIFS_FILE).get(username, []); unread = sum(1 for n in notifs if not n.get('read')); current_user_obj = load_json(USERS_FILE).get(username, {})
     return render_template('watch_history.html', history=history_list, unread_notifs=unread, current_user_obj=current_user_obj)
 
@@ -545,16 +676,34 @@ def admin_dashboard():
             if target and is_valid_username(target) and target in live_streams:
                 try: socketio.emit('force_stream_end', room=online_users.get(target))
                 except: pass
-                live_streams.pop(target, None); log_activity(f'killed_stream_{target}', session['username'])
+                live_streams.pop(target, None)
+                stream_viewers.pop(target, None)
+                socketio.emit('stream_ended', {'broadcaster': target}, broadcast=True)
+                log_activity(f'killed_stream_{target}', session['username'])
         elif action == 'toggle_visibility': 
             vid = request.form.get('target_vid')
             if vid and vid in videos: videos[vid]['visibility'] = 'hidden' if videos[vid].get('visibility', 'visible') == 'visible' else 'visible'; save_json(VIDEOS_FILE, videos)
         elif action == 'delete_video': 
             vid = request.form.get('target_vid')
             if vid and vid in videos:
-                filename = videos[vid].get('filename')
-                if filename and safe_filename_check(filename) and os.path.exists(os.path.join(VIDEO_DIR, filename)): os.remove(os.path.join(VIDEO_DIR, filename))
-                del videos[vid]; save_json(VIDEOS_FILE, videos)
+                video_entry = videos[vid]
+                filename = video_entry.get('filename')
+                thumbnail = video_entry.get('thumbnail')
+                if filename and safe_filename_check(filename) and os.path.exists(os.path.join(VIDEO_DIR, filename)):
+                    os.remove(os.path.join(VIDEO_DIR, filename))
+                if thumbnail and safe_filename_check(thumbnail) and os.path.exists(os.path.join(THUMBNAIL_DIR, thumbnail)):
+                    os.remove(os.path.join(THUMBNAIL_DIR, thumbnail))
+                del videos[vid]
+                save_json(VIDEOS_FILE, videos)
+                comments = load_json(COMMENTS_FILE); comments.pop(vid, None); save_json(COMMENTS_FILE, comments)
+                for filepath in (SAVED_FILE, HISTORY_FILE):
+                    data = load_json(filepath)
+                    for owner, entries in data.items():
+                        if filepath == SAVED_FILE and isinstance(entries, list):
+                            data[owner] = [entry for entry in entries if entry != vid]
+                        elif filepath == HISTORY_FILE and isinstance(entries, list):
+                            data[owner] = [entry for entry in entries if entry.get('video_id') != vid]
+                    save_json(filepath, data)
         elif action == 'revoke_session': 
             sid = request.form.get('revoke_sid')
             if sid and sid in sessions: sessions.pop(sid, None); save_json(SESSIONS_FILE, sessions)
@@ -573,10 +722,13 @@ def admin_dashboard():
                 if new_name and new_name != original:
                     if not is_valid_username(new_name): return redirect(url_for('admin_dashboard', msg='Invalid new username', msg_type='error'))
                     if new_name in users: return redirect(url_for('admin_dashboard', msg='New name exists', msg_type='error'))
-                    users[new_name] = user_data; del users[original]
-                    for sid, sdata in sessions.items():
-                        if sdata.get('username') == original: sdata['username'] = new_name
-                    save_json(SESSIONS_FILE, sessions); original = new_name
+                    old_name = original
+                    users[new_name] = user_data
+                    del users[old_name]
+                    save_json(USERS_FILE, users)
+                    rename_user_references(old_name, new_name)
+                    sessions = load_json(SESSIONS_FILE)
+                    original = new_name
                 if new_pass:
                     if len(new_pass) < 6: return redirect(url_for('admin_dashboard', msg='Password too short', msg_type='error'))
                     user_data['password_hash'] = generate_password_hash(new_pass); revoke_all_user_sessions(original)
@@ -615,7 +767,10 @@ def admin_user_history(target_user):
     history_db = load_json(HISTORY_FILE); videos = load_json(VIDEOS_FILE); users = load_json(USERS_FILE); history_list = []; total_mins = 0
     for h in history_db.get(target_user, []):
         vid = h.get('video_id')
-        if vid and vid in videos: v = videos[vid]; history_list.append({'video_id': vid, 'title': v.get('title', 'Untitled'), 'uploader': v.get('uploader', 'Unknown'), 'watched_at': h.get('timestamp', ''), 'thumbnail': v.get('thumbnail')}); total_mins += h.get('duration', 0) // 60
+        if vid and vid in videos:
+            v = videos[vid]
+            history_list.append({'video_id': vid, 'title': v.get('title', 'Untitled'), 'uploader': v.get('uploader', 'Unknown'), 'watched_at': h.get('timestamp', ''), 'thumbnail': v.get('thumbnail')})
+            total_mins += h.get('duration', 0) // 60
     history_list.reverse(); unread = 0; notifs = load_json(NOTIFS_FILE).get(session['username'], []); unread = sum(1 for n in notifs if not n.get('read')); current_user_obj = users.get(session['username'], {})
     return render_template('admin_user_history.html', target_user=target_user, history=history_list, total_watch_mins=total_mins, video_count=len(history_list), unread_notifs=unread, current_user_obj=current_user_obj)
 
@@ -635,18 +790,42 @@ def live_watch(broadcaster):
 # ==================== API ROUTES ====================
 @app.route('/api/track_engagement', methods=['POST'])
 @login_required
-@limiter.exempt
+@limiter.limit('1000 per hour')
 def track_engagement():
-    data = request.get_json(); engage = load_json(ENGAGE_FILE); user = session['username']
-    if user not in engage: engage[user] = {}
+    data = request.get_json(silent=True) or {}
     vid = data.get('video_id')
-    if vid not in engage[user]: engage[user][vid] = 0
-    engage[user][vid] += data.get('seconds', 5); save_json(ENGAGE_FILE, engage); return jsonify({'status': 'ok'})
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(vid, str) or vid not in videos:
+        return jsonify({'status': 'error', 'message': 'Video not found'}), 404
+    if not can_view_video(videos[vid], session.get('username'), session.get('role')):
+        return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+    try:
+        seconds = max(1, min(int(data.get('seconds', 5)), 5))
+    except (TypeError, ValueError):
+        seconds = 5
+    engage = load_json(ENGAGE_FILE)
+    user = session['username']
+    if not isinstance(engage.get(user), dict):
+        engage[user] = {}
+    engage[user][vid] = int(engage[user].get(vid, 0)) + seconds
+    save_json(ENGAGE_FILE, engage)
+    return jsonify({'status': 'ok'})
 
 @app.route('/api/like_comment', methods=['POST'])
 @login_required
 def like_comment():
-    data = request.get_json(); video_id = data.get('video_id'); comment_id = data.get('comment_id'); comments_db = load_json(COMMENTS_FILE); comments = comments_db.get(video_id, [])
+    data = request.get_json(silent=True) or {}
+    video_id = data.get('video_id')
+    comment_id = data.get('comment_id')
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(video_id, str) or video_id not in videos:
+        return jsonify({'status': 'error', 'message': 'Video not found'}), 404
+    if not can_view_video(videos[video_id], session.get('username'), session.get('role')):
+        return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+    if not isinstance(comment_id, str):
+        return jsonify({'status': 'error', 'message': 'Comment not found'}), 404
+    comments_db = load_json(COMMENTS_FILE)
+    comments = comments_db.get(video_id, [])
     def find_and_like(comment_list):
         for c in comment_list:
             if c['id'] == comment_id: likes = c.get('likes', []); (likes.remove(session['username']) if session['username'] in likes else likes.append(session['username'])); c['likes'] = likes; return len(likes)
@@ -661,56 +840,118 @@ def like_comment():
 @app.route('/api/save_video', methods=['POST'])
 @login_required
 def save_video():
-    data = request.get_json(); saved_db = load_json(SAVED_FILE); user = session['username']
-    if user not in saved_db: saved_db[user] = []
-    vid = data.get('video_id'); saved = False
-    if vid in saved_db[user]: saved_db[user].remove(vid)
-    else: saved_db[user].append(vid); saved = True
-    save_json(SAVED_FILE, saved_db); return jsonify({'status': 'ok', 'saved': saved})
+    data = request.get_json(silent=True) or {}
+    vid = data.get('video_id')
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(vid, str) or vid not in videos:
+        return jsonify({'status': 'error', 'message': 'Video not found'}), 404
+    if not can_view_video(videos[vid], session.get('username'), session.get('role')):
+        return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+    saved_db = load_json(SAVED_FILE)
+    user = session['username']
+    if not isinstance(saved_db.get(user), list):
+        saved_db[user] = []
+    if vid in saved_db[user]:
+        saved_db[user].remove(vid)
+        saved = False
+    else:
+        saved_db[user].append(vid)
+        saved = True
+    save_json(SAVED_FILE, saved_db)
+    return jsonify({'status': 'ok', 'saved': saved})
 
 @app.route('/api/watch_history', methods=['POST'])
 @login_required
-@limiter.exempt
 def api_watch_history():
-    data = request.get_json(); history_db = load_json(HISTORY_FILE); user = session['username']
-    if user not in history_db: history_db[user] = []
-    history_db[user].append({'video_id': data.get('video_id'), 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 'duration': 5}); history_db[user] = history_db[user][-500:]; save_json(HISTORY_FILE, history_db); return jsonify({'status': 'ok'})
+    data = request.get_json(silent=True) or {}
+    vid = data.get('video_id')
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(vid, str) or vid not in videos:
+        return jsonify({'status': 'error', 'message': 'Video not found'}), 404
+    if not can_view_video(videos[vid], session.get('username'), session.get('role')):
+        return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+    history_db = load_json(HISTORY_FILE)
+    user = session['username']
+    if not isinstance(history_db.get(user), list):
+        history_db[user] = []
+    history_db[user].append({'video_id': vid, 'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), 'duration': 5})
+    history_db[user] = history_db[user][-500:]
+    save_json(HISTORY_FILE, history_db)
+    return jsonify({'status': 'ok'})
 
 @app.route('/api/playlists', methods=['GET', 'POST'])
 @login_required
 def api_playlists():
-    playlists_db = load_json(PLAYLISTS_FILE); user = session['username']
+    playlists_db = load_json(PLAYLISTS_FILE)
+    user = session['username']
     if request.method == 'POST':
-        name = request.get_json().get('name', '').strip()
-        if name: pl_id = str(uuid.uuid4()); playlists_db[pl_id] = {'name': name, 'owner': user, 'videos': [], 'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}; save_json(PLAYLISTS_FILE, playlists_db); return jsonify({'status': 'ok', 'id': pl_id})
-    user_playlists = [{'id': pl_id, 'name': pl['name'], 'video_count': len(pl.get('videos', []))} for pl_id, pl in playlists_db.items() if pl.get('owner') == user]
+        data = request.get_json(silent=True) or {}
+        name = data.get('name', '')
+        name = name.strip()[:100] if isinstance(name, str) else ''
+        if not name:
+            return jsonify({'status': 'error', 'message': 'Playlist name is required'}), 400
+        pl_id = str(uuid.uuid4())
+        playlists_db[pl_id] = {'name': name, 'owner': user, 'videos': [], 'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}
+        save_json(PLAYLISTS_FILE, playlists_db)
+        return jsonify({'status': 'ok', 'id': pl_id})
+    user_playlists = [{'id': pl_id, 'name': pl.get('name', 'Untitled'), 'video_count': len(pl.get('videos', []))} for pl_id, pl in playlists_db.items() if pl.get('owner') == user]
     return jsonify({'playlists': user_playlists})
 
 @app.route('/api/playlists/<pl_id>/videos', methods=['POST'])
 @login_required
 def api_add_to_playlist(pl_id):
-    playlists_db = load_json(PLAYLISTS_FILE); video_id = request.get_json().get('video_id'); pl = playlists_db.get(pl_id)
-    if not pl or pl.get('owner') != session['username']: return jsonify({'status': 'error', 'message': 'Not found'}), 404
-    if video_id not in pl.get('videos', []): pl['videos'].append(video_id); save_json(PLAYLISTS_FILE, playlists_db); return jsonify({'status': 'ok', 'message': 'Added to playlist'})
+    playlists_db = load_json(PLAYLISTS_FILE)
+    data = request.get_json(silent=True) or {}
+    video_id = data.get('video_id')
+    pl = playlists_db.get(pl_id)
+    if not pl or pl.get('owner') != session['username']:
+        return jsonify({'status': 'error', 'message': 'Not found'}), 404
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(video_id, str) or video_id not in videos:
+        return jsonify({'status': 'error', 'message': 'Video not found'}), 404
+    if not can_view_video(videos[video_id], session.get('username'), session.get('role')):
+        return jsonify({'status': 'error', 'message': 'Forbidden'}), 403
+    if video_id not in pl.get('videos', []):
+        pl.setdefault('videos', []).append(video_id)
+        save_json(PLAYLISTS_FILE, playlists_db)
+        return jsonify({'status': 'ok', 'message': 'Added to playlist'})
     return jsonify({'status': 'ok', 'message': 'Already in playlist'})
 
 # ==================== MEDIA SERVING ====================
 @app.route('/media/<filename>')
 @login_required
 def serve_media(filename):
-    if not safe_filename_check(filename): abort(404)
+    if not safe_filename_check(filename):
+        abort(404)
+    videos = load_json(VIDEOS_FILE)
+    video = next((item for item in videos.values() if item.get('filename') == filename), None)
+    if not video:
+        abort(404)
+    if not can_view_video(video, session.get('username'), session.get('role')):
+        abort(403)
     return send_from_directory(VIDEO_DIR, filename)
 
 @app.route('/thumbnails/<filename>')
 @login_required
 def serve_thumbnail(filename):
-    if not safe_filename_check(filename): abort(404)
+    if not safe_filename_check(filename):
+        abort(404)
+    videos = load_json(VIDEOS_FILE)
+    video = next((item for item in videos.values() if item.get('thumbnail') == filename), None)
+    if not video:
+        abort(404)
+    if not can_view_video(video, session.get('username'), session.get('role')):
+        abort(403)
     return send_from_directory(THUMBNAIL_DIR, filename)
 
 @app.route('/media/profiles/<filename>')
 @login_required
 def serve_profile(filename):
-    if not safe_filename_check(filename): abort(404)
+    if not safe_filename_check(filename):
+        abort(404)
+    users = load_json(USERS_FILE)
+    if not any(user_data.get('profile_pic') == filename for user_data in users.values()):
+        abort(404)
     return send_from_directory(PROFILE_DIR, filename)
 
 # ==================== SOCKET.IO ====================
@@ -727,27 +968,85 @@ def handle_register(data):
 @socketio.on('disconnect')
 def handle_disconnect():
     for username, sid in list(online_users.items()):
-        if sid == request.sid: del online_users[username]; user_status[username] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M"); break
+        if sid == request.sid:
+            del online_users[username]
+            user_status[username] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+            break
+    # Remove a disconnected viewer from every stream's peer list.
+    for broadcaster, viewer_sids in list(stream_viewers.items()):
+        viewer_sids.discard(request.sid)
+        if not viewer_sids:
+            stream_viewers.pop(broadcaster, None)
+    # A broadcaster disconnect ends their stream and releases its viewers.
+    for username, stream in list(live_streams.items()):
+        if stream.get('sid') == request.sid:
+            live_streams.pop(username, None)
+            stream_viewers.pop(username, None)
+            socketio.emit('stream_ended', {'broadcaster': username}, broadcast=True)
+            break
 
 @socketio.on('start_live_stream')
 def handle_start_stream(data):
     username = session.get('username')
-    if username and is_valid_username(username) and username in load_json(USERS_FILE): live_streams[username] = {'title': str(data.get('title', 'Untitled Stream'))[:100], 'sid': request.sid}; emit('stream_started', {'broadcaster': username}, broadcast=True)
+    data = data if isinstance(data, dict) else {}
+    users = load_json(USERS_FILE)
+    sessions = load_json(SESSIONS_FILE)
+    sid = session.get('session_id')
+    if username and is_valid_username(username) and username in users and sid in sessions:
+        live_streams[username] = {'title': str(data.get('title', 'Untitled Stream'))[:100], 'sid': request.sid}
+        stream_viewers[username] = set()
+        emit('stream_started', {'broadcaster': username}, broadcast=True)
 
 @socketio.on('stop_live_stream')
 def handle_stop_stream():
     username = session.get('username')
-    if username and username in live_streams: del live_streams[username]; emit('stream_ended', {'broadcaster': username}, broadcast=True)
+    stream = live_streams.get(username) if username else None
+    if stream and stream.get('sid') == request.sid:
+        del live_streams[username]
+        stream_viewers.pop(username, None)
+        emit('stream_ended', {'broadcaster': username}, broadcast=True)
 
 @socketio.on('join_live_stream')
 def handle_join_stream(data):
+    data = data if isinstance(data, dict) else {}
+    username = session.get('username')
+    sessions = load_json(SESSIONS_FILE)
+    if not username or session.get('session_id') not in sessions:
+        return
     broadcaster = data.get('broadcaster')
-    if broadcaster and is_valid_username(broadcaster) and broadcaster in live_streams: emit('viewer_joined', {'viewer_sid': request.sid}, room=live_streams[broadcaster]['sid'])
+    stream = live_streams.get(broadcaster) if isinstance(broadcaster, str) else None
+    if stream and is_valid_username(broadcaster):
+        stream_viewers.setdefault(broadcaster, set()).add(request.sid)
+        emit('viewer_joined', {'viewer_sid': request.sid}, room=stream['sid'])
 
 @socketio.on('webrtc_signal')
 def handle_webrtc(data):
-    target_sid = data.get('target_sid') or online_users.get(data.get('target_user'))
-    if target_sid: emit('webrtc_signal', {'sender': request.sid, 'sdp': data.get('sdp'), 'candidate': data.get('candidate')}, room=target_sid)
+    if not isinstance(data, dict) or session.get('session_id') not in load_json(SESSIONS_FILE):
+        return
+    target_sid = data.get('target_sid')
+    if not isinstance(target_sid, str):
+        return
+    allowed = False
+    for broadcaster, viewer_sids in stream_viewers.items():
+        stream = live_streams.get(broadcaster)
+        if not stream:
+            continue
+        broadcaster_sid = stream.get('sid')
+        if request.sid == broadcaster_sid and target_sid in viewer_sids:
+            allowed = True
+            break
+        if request.sid in viewer_sids and target_sid == broadcaster_sid:
+            allowed = True
+            break
+    if not allowed:
+        return
+    payload = {'sender': request.sid}
+    if isinstance(data.get('sdp'), dict):
+        payload['sdp'] = data['sdp']
+    if isinstance(data.get('candidate'), dict):
+        payload['candidate'] = data['candidate']
+    if len(payload) > 1:
+        emit('webrtc_signal', payload, room=target_sid)
 
 # ==================== TEMPLATES ====================
 templates = {
@@ -761,7 +1060,7 @@ templates = {
     <meta name="theme-color" content="#ff0000">
     <title>FamTube</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.js"></script>
-    <script>function getCookie(n){let m=document.cookie.match(new RegExp('(^| )'+n+'=([^;]+)'));return m?m[2]:null;}if(getCookie('theme')==='dark')document.documentElement.classList.add('dark-mode');</script>
+    <script>function getCookie(n){let m=document.cookie.match(new RegExp('(^| )'+n+'=([^;]+)'));return m?m[2]:null;}if(getCookie('theme')==='dark')document.documentElement.classList.add('dark-mode');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b&&document.documentElement.classList.contains('dark-mode'))b.textContent='☀️';});</script>
     <style>
         :root {
             --bg: #ffffff; --surface: #ffffff; --text: #0f0f0f; --text2: #606060;
@@ -867,45 +1166,166 @@ templates = {
             .bottom-nav { display: none; }
             .container { padding-bottom: 20px; }
         }
+
+        /* Responsive refresh: YouTube-inspired shell, without removing FamTube features. */
+        html { scroll-behavior: smooth; }
+        body { min-height: 100vh; overflow-x: hidden; }
+        button, input, textarea, select { font: inherit; }
+        button, a, input, textarea, select { touch-action: manipulation; }
+        a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+            outline: 2px solid var(--primary); outline-offset: 2px;
+        }
+        button:disabled { cursor: wait; opacity: .65; }
+        .navbar { position: sticky; top: 0; padding-inline: clamp(10px, 1.6vw, 24px); gap: clamp(6px, 1vw, 18px); }
+        .nav-left, .nav-right { gap: clamp(4px, .8vw, 14px); flex-shrink: 0; }
+        .nav-left { min-width: 0; }
+        .logo { white-space: nowrap; }
+        .search-container { min-width: 0; }
+        .overlay.open { display: block; }
+        .search-form { display: flex; align-items: center; width: 100%; min-width: 0; }
+        .search-input { margin: 0; min-width: 0; height: 40px; }
+        .search-btn { flex: 0 0 64px; }
+        .search-icon-mobile { display: none; border: 0; background: transparent; cursor: pointer; }
+        .theme-toggle { font-size: 19px; }
+        .avatar { flex-shrink: 0; }
+        .container { min-width: 0; }
+        .admin-panel { min-width: 0; overflow-wrap: anywhere; }
+        .grid { align-items: start; }
+        .video-card { min-width: 0; border-radius: 12px; }
+        .thumbnail { aspect-ratio: 16 / 9; border-radius: 12px; }
+        .thumbnail img { transition: transform .22s ease; }
+        @media (hover: hover) and (pointer: fine) {
+            .video-card:hover .thumbnail img { transform: scale(1.025); }
+            .video-card:hover .video-title { color: var(--primary); }
+        }
+        .video-info { min-width: 0; }
+        .video-details { overflow-wrap: anywhere; }
+        .primary-btn, .tab, .icon-btn { -webkit-tap-highlight-color: transparent; }
+        .watch-player-shell { margin: 0 0 16px; background: #000; border-radius: 14px; overflow: hidden; }
+        .watch-player { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; max-height: calc(100vh - 110px); object-fit: contain; background: #000; }
+        .toast-container { bottom: calc(76px + env(safe-area-inset-bottom)); max-width: min(380px, calc(100vw - 24px)); }
+        .toast { box-shadow: 0 8px 24px rgba(0,0,0,.22); overflow-wrap: anywhere; }
+        table { display: table; }
+        .tabs { scrollbar-width: none; }
+
+        @media (min-width: 769px) {
+            .overlay { display: none !important; }
+            .sidebar {
+                top: 56px; left: 0; width: 240px; height: calc(100vh - 56px); height: calc(100dvh - 56px);
+                border-right: 0; padding: 12px 10px 24px; z-index: 90; transition: left .22s ease;
+                box-shadow: none;
+            }
+            .sidebar-header { display: none; }
+            .sidebar-links a { gap: 20px; padding: 11px 14px; margin: 2px 0; border-radius: 10px; }
+            .sidebar-links a:hover { background: var(--hover); }
+            .sidebar-links a:active, .sidebar-links a.active { background: var(--hover); font-weight: 600; }
+            body.authenticated .container { max-width: none; width: calc(100% - 240px); margin: 0 0 0 240px; padding: 24px clamp(20px, 2.5vw, 42px) 36px; }
+            body.authenticated.sidebar-collapsed .sidebar { left: -260px; }
+            body.authenticated.sidebar-collapsed .container { width: 100%; margin-left: 0; }
+            .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px 18px; }
+            .video-title { font-size: 15px; font-weight: 600; }
+            .nav-left { min-width: 210px; }
+            .watch-player-shell { border-radius: 14px; }
+        }
+        @media (min-width: 1450px) {
+            body.authenticated .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        }
+        @media (min-width: 769px) and (max-width: 1050px) {
+            body.authenticated .container { padding-inline: 18px; }
+            .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px 14px; }
+            .sidebar { width: 220px; }
+            body.authenticated .container { width: calc(100% - 220px); margin-left: 220px; }
+            body.authenticated.sidebar-collapsed .container { width: 100%; margin-left: 0; }
+        }
+        @media (max-width: 768px) {
+            .navbar { height: 56px; padding: 8px 10px; gap: 5px; }
+            .nav-left { gap: 5px; }
+            .nav-right { gap: 1px; }
+            .navbar .logo { font-size: 17px; gap: 2px; }
+            .navbar .icon-btn { width: 36px; height: 36px; padding: 5px; font-size: 20px; }
+            .search-container { display: none; }
+            .search-container.mobile-open {
+                display: flex; position: absolute; top: 60px; left: 10px; right: 10px; width: auto; max-width: none;
+                padding: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+                box-shadow: 0 8px 28px rgba(0,0,0,.2); z-index: 1100;
+            }
+            .search-container.mobile-open .search-input { font-size: 16px; }
+            .search-icon-mobile { display: flex; align-items: center; justify-content: center; }
+            .container { width: 100%; margin: 0; padding: 12px 0 calc(88px + env(safe-area-inset-bottom)); }
+            .grid { grid-template-columns: minmax(0, 1fr); gap: 22px; }
+            .video-card { padding: 0 12px; }
+            .thumbnail { border-radius: 12px; }
+            .video-info { padding-top: 10px; gap: 10px; }
+            .video-title { font-size: 15px; line-height: 1.35; }
+            .channel-name, .tags { font-size: 12px; }
+            .admin-panel { border-radius: 12px; margin-inline: 12px; padding: 14px; border: 1px solid var(--border); }
+            .watch-player-shell { margin: 0 0 14px; border-radius: 0; }
+            .watch-player { max-height: none; }
+            .bottom-nav { height: calc(60px + env(safe-area-inset-bottom)); padding: 3px 0 env(safe-area-inset-bottom); }
+            .bottom-nav a { min-width: 0; font-size: 10px; gap: 3px; }
+            .bottom-nav .nav-icon { font-size: 22px; }
+            .bottom-nav .upload-btn { width: 40px; height: 30px; }
+            .toast-container { bottom: calc(70px + env(safe-area-inset-bottom)); right: 10px; }
+            .tabs { padding-inline: 12px; }
+            body.nav-open { overflow: hidden; }
+            .sidebar { width: min(300px, 86vw); padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+            .sidebar-links a { min-height: 46px; }
+            table { min-width: 560px; }
+            .table-scroll, [style*="overflow-x:auto"] { max-width: 100%; }
+            .watch-player-shell + div, .watch-player-shell ~ .admin-panel { margin-inline: 12px; }
+        }
+        @media (max-width: 380px) {
+            .navbar .logo { font-size: 15px; }
+            .navbar .icon-btn { width: 32px; height: 34px; }
+            .navbar .nav-left .menu-toggle { width: 30px; }
+            .nav-right { gap: 0; }
+            .avatar { width: 29px; height: 29px; }
+            .video-info { gap: 8px; }
+            .channel-avatar { width: 32px; height: 32px; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+        }
     </style>
 </head>
-<body>
+<body class="{% if session.username %}authenticated{% endif %}">
 {% if session.username %}
     <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <a href="/" class="logo"><span>▶</span> FamTube</a>
-            <button class="icon-btn" onclick="toggleSidebar()" style="font-size:24px;">✕</button>
+            <button class="icon-btn" type="button" onclick="toggleSidebar()" aria-label="Close navigation" style="font-size:24px;">✕</button>
         </div>
         <div class="sidebar-links">
-            <a href="/"><span class="icon">🏠</span> Home</a>
-            <a href="/explore"><span class="icon">🔥</span> Explore</a>
-            <a href="/subscriptions"><span class="icon">🔔</span> Subscriptions</a>
+            <a href="/" {% if request.endpoint == 'index' %}class="active"{% endif %}><span class="icon">🏠</span> Home</a>
+            <a href="/explore" {% if request.endpoint == 'explore' %}class="active"{% endif %}><span class="icon">🔥</span> Explore</a>
+            <a href="/subscriptions" {% if request.endpoint == 'subscriptions' %}class="active"{% endif %}><span class="icon">🔔</span> Subscriptions</a>
             <div style="height:1px;background:var(--border);margin:8px 0;"></div>
-            <a href="/history"><span class="icon">📜</span> History</a>
-            <a href="/playlists"><span class="icon">📂</span> Playlists</a>
-            <a href="/saved"><span class="icon">💾</span> Saved</a>
+            <a href="/history" {% if request.endpoint == 'watch_history' %}class="active"{% endif %}><span class="icon">📜</span> History</a>
+            <a href="/playlists" {% if request.endpoint in ['playlists', 'playlist_detail'] %}class="active"{% endif %}><span class="icon">📂</span> Playlists</a>
+            <a href="/saved" {% if request.endpoint == 'saved_videos' %}class="active"{% endif %}><span class="icon">💾</span> Saved</a>
             <div style="height:1px;background:var(--border);margin:8px 0;"></div>
-            <a href="/settings"><span class="icon">⚙️</span> Settings</a>
-            {% if session.role == 'admin' %}<a href="/famtube_admin"><span class="icon">🛡️</span> Admin</a>{% endif %}
+            <a href="/settings" {% if request.endpoint == 'settings' %}class="active"{% endif %}><span class="icon">⚙️</span> Settings</a>
+            {% if session.role == 'admin' %}<a href="/famtube_admin" {% if request.endpoint in ['admin_dashboard', 'admin_user_history'] %}class="active"{% endif %}><span class="icon">🛡️</span> Admin</a>{% endif %}
             <a href="/logout"><span class="icon">🚪</span> Logout</a>
         </div>
     </div>
 
     <div class="navbar">
         <div class="nav-left">
-            <button class="icon-btn" onclick="toggleSidebar()">≡</button>
+            <button class="icon-btn menu-toggle" type="button" onclick="toggleSidebar()" aria-label="Toggle navigation">≡</button>
             <a href="/" class="logo"><span>▶</span> FamTube</a>
         </div>
-        <div class="search-container">
-            <form class="search-container" action="/search" method="GET">
-                <input class="search-input" type="text" name="q" placeholder="Search" required>
-                <button class="search-btn" type="submit">🔍</button>
+        <div class="search-container" id="navSearch">
+            <form class="search-form" action="/search" method="GET" role="search">
+                <input class="search-input" type="search" name="q" placeholder="Search videos and people" aria-label="Search videos and people" required>
+                <button class="search-btn" type="submit" aria-label="Submit search">🔍</button>
             </form>
         </div>
         <div class="nav-right">
-            <a href="/search" class="search-icon-mobile">🔍</a>
-            <a href="/notifications" class="icon-btn">🔔<span class="badge" id="notif-badge" style="display:{% if unread_notifs > 0 %}flex{% else %}none{% endif %};">{{ unread_notifs }}</span></a>
+            <button type="button" class="icon-btn search-icon-mobile" onclick="toggleMobileSearch()" aria-label="Open search">🔍</button>
+            <button type="button" class="icon-btn theme-toggle" onclick="toggleTheme()" aria-label="Toggle light and dark theme" title="Toggle theme">🌙</button>
+            <a href="/notifications" class="icon-btn" aria-label="Notifications">🔔<span class="badge" id="notif-badge" style="display:{% if unread_notifs > 0 %}flex{% else %}none{% endif %};">{{ unread_notifs }}</span></a>
             <a href="/user/{{ session.username }}" class="avatar">
                 {% if current_user_obj.get('profile_pic') %}<img src="/media/profiles/{{ current_user_obj.profile_pic }}" class="avatar-img">{% else %}{{ session.username[0]|upper }}{% endif %}
             </a>
@@ -914,7 +1334,7 @@ templates = {
 {% endif %}
 
 <div class="toast-container" id="toast-container"></div>
-<div class="container">{% block content %}{% endblock %}</div>
+<main class="container">{% block content %}{% endblock %}</main>
 
 {% if session.username %}
     <div class="bottom-nav">
@@ -938,9 +1358,15 @@ templates = {
     });
     socket.on('force_stream_end', () => { alert("Stream ended by admin."); window.location.href = '/'; });
     function showToast(msg, link) {
-        const toast = document.createElement('div'); toast.className = 'toast';
-        toast.innerHTML = `🔔 ${msg.substring(0, 60)}`;
-        toast.onclick = () => { if(link) window.location.href = link; };
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        toast.textContent = '🔔 ' + String(msg || '').substring(0, 60);
+        if (link && typeof link === 'string' && link.startsWith('/')) {
+            toast.setAttribute('role', 'link');
+            toast.tabIndex = 0;
+            toast.onclick = () => { window.location.href = link; };
+            toast.onkeydown = (event) => { if (event.key === 'Enter') window.location.href = link; };
+        }
         document.getElementById('toast-container').appendChild(toast);
         setTimeout(() => toast.remove(), 5000);
     }
@@ -948,14 +1374,62 @@ templates = {
 {% endif %}
 <script>
     function toggleSidebar() {
-        document.getElementById('sidebar').classList.toggle('open');
-        document.getElementById('overlay').classList.toggle('open');
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('overlay');
+        if (!sidebar || !overlay) return;
+        if (window.matchMedia('(min-width: 769px)').matches) {
+            document.body.classList.toggle('sidebar-collapsed');
+            overlay.classList.remove('open');
+        } else {
+            sidebar.classList.toggle('open');
+            overlay.classList.toggle('open', sidebar.classList.contains('open'));
+            document.body.classList.toggle('nav-open', sidebar.classList.contains('open'));
+        }
+    }
+    function toggleMobileSearch() {
+        const search = document.getElementById('navSearch');
+        if (!search) return;
+        search.classList.toggle('mobile-open');
+        if (search.classList.contains('mobile-open')) {
+            const input = search.querySelector('input[name="q"]');
+            if (input) input.focus();
+        }
     }
     function toggleTheme() {
         const html = document.documentElement;
         html.classList.toggle('dark-mode');
-        document.cookie = 'theme=' + (html.classList.contains('dark-mode') ? 'dark' : 'light') + ';path=/;max-age=31536000';
+        const dark = html.classList.contains('dark-mode');
+        document.cookie = 'theme=' + (dark ? 'dark' : 'light') + ';path=/;max-age=31536000;SameSite=Lax';
+        const button = document.querySelector('.theme-toggle');
+        if (button) {
+            button.textContent = dark ? '☀️' : '🌙';
+            button.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+        }
     }
+    window.addEventListener('resize', () => {
+        const sidebar = document.getElementById('sidebar');
+        const overlay = document.getElementById('overlay');
+        const search = document.getElementById('navSearch');
+        if (window.matchMedia('(min-width: 769px)').matches) {
+            if (sidebar) sidebar.classList.remove('open');
+            if (overlay) overlay.classList.remove('open');
+            document.body.classList.remove('nav-open');
+        } else {
+            document.body.classList.remove('sidebar-collapsed');
+        }
+        if (search && window.innerWidth > 768) search.classList.remove('mobile-open');
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('overlay');
+            const search = document.getElementById('navSearch');
+            if (sidebar) sidebar.classList.remove('open');
+            if (overlay) overlay.classList.remove('open');
+            if (search) search.classList.remove('mobile-open');
+            document.body.classList.remove('nav-open');
+        }
+    });
 </script>
 </body>
 </html>
@@ -1068,7 +1542,7 @@ templates = {
         <p style="font-size:13px;color:var(--text2);margin-bottom:16px;">Max size: {% if max_upload_size==0 %}Unlimited{% else %}{{ max_upload_size }} {{ max_upload_unit }}{% endif %}</p>
         <form id="uploadForm" method="POST" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <label>Video File *</label> <input type="file" name="video_file" accept="video/*" required>
+            <label>Video File *</label> <input type="file" name="video_file" accept="video/mp4,video/webm,video/ogg,.mp4,.webm,.ogg" required>
             <label>Thumbnail (optional)</label> <input type="file" name="thumbnail" accept="image/png,image/jpeg,image/webp">
             <label>Title *</label> <input type="text" name="title" placeholder="Video title" required>
             <label>Description</label> <textarea name="captions" rows="4" placeholder="Describe your video..."></textarea>
@@ -1080,12 +1554,12 @@ templates = {
     </div>
 </div>
 <script>
-document.getElementById('uploadForm').addEventListener('submit', function(e) {
-    e.preventDefault(); const form = this; const btn = document.getElementById('uploadBtn'); const formData = new FormData(form);
-    btn.disabled = true; btn.innerText = 'Uploading...';
-    fetch('/upload', {method: 'POST', body: formData, headers: {'X-CSRFToken': document.querySelector('meta[name="csrf-token"]').content}})
-    .then(r => { if(r.redirected) window.location.href = r.url; else return r.text().then(html => { document.open(); document.write(html); document.close(); }); })
-    .catch(() => { alert('Upload failed'); btn.disabled = false; btn.innerText = 'Upload Video'; });
+document.getElementById('uploadForm').addEventListener('submit', function() {
+    const btn = document.getElementById('uploadBtn');
+    if (this.reportValidity()) {
+        btn.disabled = true;
+        btn.textContent = 'Uploading…';
+    }
 });
 </script>
 {% endblock %}
@@ -1094,8 +1568,8 @@ document.getElementById('uploadForm').addEventListener('submit', function(e) {
 {% extends 'base.html' %}
 {% block content %}
 <div style="max-width:1000px;margin:0 auto;">
-    <div style="margin: -12px -16px 16px -16px; background:#000;">
-        <video id="videoPlayer" controls style="width:100%; display:block; max-height: 40vh; object-fit: contain;">
+    <div class="watch-player-shell">
+        <video id="videoPlayer" class="watch-player" controls playsinline preload="metadata">
             <source src="/media/{{ video.filename }}">
         </video>
     </div>
@@ -1151,8 +1625,13 @@ document.getElementById('uploadForm').addEventListener('submit', function(e) {
 </div>
 <script>
 const videoId = '{{ video_id }}'; const csrfToken = document.querySelector('meta[name="csrf-token"]').content; let watchInterval, isMusicMode = false; const vp = document.getElementById('videoPlayer'); const ap = new Audio('/media/{{ video.filename }}');
-function startTracking() { watchInterval = setInterval(() => { fetch('/api/track_engagement', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId, seconds: 5})}); }, 5000); }
-function stopTracking() { clearInterval(watchInterval); }
+function startTracking() {
+    stopTracking();
+    watchInterval = setInterval(() => {
+        fetch('/api/track_engagement', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId, seconds: 5})}).catch(() => {});
+    }, 5000);
+}
+function stopTracking() { if (watchInterval) { clearInterval(watchInterval); watchInterval = null; } }
 vp.onplay = () => { startTracking(); fetch('/api/watch_history', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId})}); }; vp.onpause = stopTracking; vp.onended = stopTracking; ap.onpause = stopTracking; ap.onended = stopTracking; ap.onplay = startTracking;
 function toggleMusicMode() { isMusicMode = !isMusicMode; const btn = document.getElementById('musicModeToggle'); if(isMusicMode) { ap.currentTime = vp.currentTime; vp.pause(); vp.style.display = 'none'; ap.style.display = 'block'; ap.play(); btn.innerText = "🎧 Video"; } else { vp.currentTime = ap.currentTime; ap.pause(); ap.style.display = 'none'; vp.style.display = 'block'; vp.play(); btn.innerText = "🎧 Music"; } }
 function saveVideo() { fetch('/api/save_video', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId})}).then(r => r.json()).then(() => location.reload()); }
@@ -1356,14 +1835,14 @@ function closeModal() { document.getElementById('playlistModal').style.display =
     </div>
 </div>
 <script>
-const socket = io(); let localStream = null, peerConnections = {}; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
+const liveSocket = io(); let localStream = null, peerConnections = {}; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 function isSecure() { return window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1'; }
 async function requestMediaAccess() { if(!isSecure()) { alert('Insecure Context. Please use HTTPS or localhost.'); return; } try { localStream = await navigator.mediaDevices.getUserMedia({video: {width: {ideal: 1280}, height: {ideal: 720}}, audio: true}); document.getElementById('localVideo').srcObject = localStream; document.getElementById('permWarning').style.display = 'none'; document.getElementById('requestBtn').style.display = 'none'; document.getElementById('startBtn').style.display = 'inline-block'; document.getElementById('statusText').innerText = '✅ Ready. Click Start Stream.'; } catch(e) { document.getElementById('statusText').innerText = 'Error: ' + e.message; document.getElementById('permWarning').style.display = 'block'; } }
-document.getElementById('startBtn').onclick = () => { const title = document.getElementById('streamTitle').value || 'Untitled Stream'; if(!localStream) return; socket.emit('start_live_stream', {title: title}); document.getElementById('startBtn').style.display = 'none'; document.getElementById('stopBtn').style.display = 'inline-block'; document.getElementById('statusText').innerText = '🔴 LIVE: ' + title; };
-document.getElementById('stopBtn').onclick = () => { if(localStream) localStream.getTracks().forEach(t => t.stop()); localStream = null; Object.values(peerConnections).forEach(pc => pc.close()); peerConnections = {}; socket.emit('stop_live_stream'); document.getElementById('localVideo').srcObject = null; document.getElementById('startBtn').style.display = 'inline-block'; document.getElementById('stopBtn').style.display = 'none'; document.getElementById('statusText').innerText = 'Stream ended'; };
-socket.on('viewer_joined', (data) => { if(!localStream) return; const viewerSid = data.viewer_sid; const pc = new RTCPeerConnection(rtcConfig); peerConnections[viewerSid] = pc; localStream.getTracks().forEach(track => pc.addTrack(track, localStream)); pc.onicecandidate = (e) => { if(e.candidate) socket.emit('webrtc_signal', {target_sid: viewerSid, candidate: e.candidate}); }; pc.createOffer().then(offer => { pc.setLocalDescription(offer); socket.emit('webrtc_signal', {target_sid: viewerSid, sdp: offer}); }); });
-socket.on('webrtc_signal', (data) => { const pc = peerConnections[data.sender]; if(!pc) return; if(data.sdp) pc.setRemoteDescription(new RTCSessionDescription(data.sdp)).then(() => { if(data.sdp.type === 'offer') pc.createAnswer().then(ans => { pc.setLocalDescription(ans); socket.emit('webrtc_signal', {target_sid: data.sender, sdp: ans}); }); }); if(data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate)); });
-socket.on('force_stream_end', () => { document.getElementById('stopBtn').click(); });
+document.getElementById('startBtn').onclick = () => { const title = document.getElementById('streamTitle').value || 'Untitled Stream'; if(!localStream) return; liveSocket.emit('start_live_stream', {title: title}); document.getElementById('startBtn').style.display = 'none'; document.getElementById('stopBtn').style.display = 'inline-block'; document.getElementById('statusText').innerText = '🔴 LIVE: ' + title; };
+document.getElementById('stopBtn').onclick = () => { if(localStream) localStream.getTracks().forEach(t => t.stop()); localStream = null; Object.values(peerConnections).forEach(pc => pc.close()); peerConnections = {}; liveSocket.emit('stop_live_stream'); document.getElementById('localVideo').srcObject = null; document.getElementById('startBtn').style.display = 'inline-block'; document.getElementById('stopBtn').style.display = 'none'; document.getElementById('statusText').innerText = 'Stream ended'; };
+liveSocket.on('viewer_joined', (data) => { if(!localStream) return; const viewerSid = data.viewer_sid; const pc = new RTCPeerConnection(rtcConfig); peerConnections[viewerSid] = pc; localStream.getTracks().forEach(track => pc.addTrack(track, localStream)); pc.onicecandidate = (e) => { if(e.candidate) liveSocket.emit('webrtc_signal', {target_sid: viewerSid, candidate: e.candidate}); }; pc.createOffer().then(offer => { pc.setLocalDescription(offer); liveSocket.emit('webrtc_signal', {target_sid: viewerSid, sdp: offer}); }); });
+liveSocket.on('webrtc_signal', (data) => { const pc = peerConnections[data.sender]; if(!pc) return; if(data.sdp) pc.setRemoteDescription(new RTCSessionDescription(data.sdp)).then(() => { if(data.sdp.type === 'offer') pc.createAnswer().then(ans => { pc.setLocalDescription(ans); liveSocket.emit('webrtc_signal', {target_sid: data.sender, sdp: ans}); }); }); if(data.candidate) pc.addIceCandidate(new RTCIceCandidate(data.candidate)); });
+liveSocket.on('force_stream_end', () => { document.getElementById('stopBtn').click(); });
 </script>
 {% endblock %}
 """,
@@ -1378,14 +1857,20 @@ socket.on('force_stream_end', () => { document.getElementById('stopBtn').click()
     </div>
 </div>
 <script>
-const socket = io(); const broadcaster = '{{ broadcaster }}'; let pc = null, broadcasterSid = null; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
+const watchSocket = io(); const broadcaster = '{{ broadcaster }}'; let pc = null, broadcasterSid = null; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 if(!window.isSecureContext && location.protocol !== 'https:') { document.getElementById('statusText').innerText = 'Connection blocked: insecure context. Use HTTPS.'; } else {
-    socket.on('connect', () => { socket.emit('join_live_stream', {broadcaster: broadcaster}); });
-    socket.on('webrtc_signal', async (data) => {
+    watchSocket.on('connect', () => { watchSocket.emit('join_live_stream', {broadcaster: broadcaster}); });
+    watchSocket.on('stream_ended', (data) => {
+        if (!data || data.broadcaster !== broadcaster) return;
+        if (pc) { pc.close(); pc = null; }
+        document.getElementById('remoteVideo').srcObject = null;
+        document.getElementById('statusText').innerText = 'This stream has ended.';
+    });
+    watchSocket.on('webrtc_signal', async (data) => {
         broadcasterSid = data.sender;
-        if(!pc) { pc = new RTCPeerConnection(rtcConfig); pc.ontrack = e => { document.getElementById('remoteVideo').srcObject = e.streams[0]; document.getElementById('statusText').innerText = 'Connected'; }; pc.onicecandidate = e => { if(e.candidate) socket.emit('webrtc_signal', {target_sid: broadcasterSid, candidate: e.candidate}); }; }
+        if(!pc) { pc = new RTCPeerConnection(rtcConfig); pc.ontrack = e => { document.getElementById('remoteVideo').srcObject = e.streams[0]; document.getElementById('statusText').innerText = 'Connected'; }; pc.onicecandidate = e => { if(e.candidate) watchSocket.emit('webrtc_signal', {target_sid: broadcasterSid, candidate: e.candidate}); }; }
         if(data.sdp) await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        if(data.sdp && data.sdp.type === 'offer') { const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); socket.emit('webrtc_signal', {target_sid: broadcasterSid, sdp: answer}); }
+        if(data.sdp && data.sdp.type === 'offer') { const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); watchSocket.emit('webrtc_signal', {target_sid: broadcasterSid, sdp: answer}); }
         if(data.candidate) await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
     });
 }
