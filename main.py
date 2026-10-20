@@ -15,21 +15,66 @@ from jinja2 import DictLoader
 from flask_talisman import Talisman
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, CSRFError
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 # Never expose Werkzeug's interactive debugger or automatic reloader from the normal launcher.
 app.config['DEBUG'] = False
 app.config['TEMPLATES_AUTO_RELOAD'] = False
-app.secret_key = os.environ.get('FAMTUBE_SECRET_KEY', secrets.token_urlsafe(32))
+
+# Keep the signing key stable across restarts. An ephemeral key silently invalidates
+# browser sessions and can make CSRF failures appear random after each restart.
+ADMIN_DIR = 'famtube_admin'
+os.makedirs(ADMIN_DIR, mode=0o700, exist_ok=True)
+_secret_key_file = os.environ.get('FAMTUBE_SECRET_KEY_FILE', os.path.join(ADMIN_DIR, '.secret_key'))
+os.makedirs(os.path.dirname(os.path.abspath(_secret_key_file)), mode=0o700, exist_ok=True)
+_secret_key = os.environ.get('FAMTUBE_SECRET_KEY')
+if not _secret_key:
+    try:
+        with open(_secret_key_file, 'x', encoding='utf-8') as _key_file:
+            _key_file.write(secrets.token_urlsafe(48))
+    except FileExistsError:
+        pass
+    try:
+        os.chmod(_secret_key_file, 0o600)
+    except OSError:
+        pass
+    with open(_secret_key_file, 'r', encoding='utf-8') as _key_file:
+        _secret_key = _key_file.read().strip()
+    if not _secret_key:
+        raise RuntimeError('Famtube signing key file is empty; set FAMTUBE_SECRET_KEY or repair famtube_admin/.secret_key')
+app.secret_key = _secret_key
 app.permanent_session_lifetime = datetime.timedelta(days=365)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = False
+# Talisman defaults SESSION_COOKIE_SECURE=True even when force_https=False. That
+# drops session cookies on plain HTTP LAN URLs and causes Flask-WTF's exact
+# "CSRF session token is missing" error. Explicit opt-in for HTTPS deployments.
+COOKIE_SECURE = os.environ.get('FAMTUBE_COOKIE_SECURE', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+app.config['SESSION_COOKIE_SECURE'] = COOKIE_SECURE
+if not COOKIE_SECURE:
+    print('⚠️ FAMTUBE_COOKIE_SECURE is disabled: use only for trusted local HTTP testing. Set FAMTUBE_COOKIE_SECURE=1 behind HTTPS in production.')
 
 limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"], storage_uri="memory://")
 csrf = CSRFProtect(app)
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(error):
+    # Keep CSRF enabled; provide a useful recovery path instead of a raw traceback.
+    response = (
+        '<!doctype html><html lang="en"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>Session check failed · FamTube</title>'
+        '<body style="font:16px system-ui;max-width:620px;margin:12vh auto;padding:24px">'
+        '<h1>Session check failed</h1>'
+        '<p>Your session cookie or form token was missing, expired, or changed.</p>'
+        '<p>Refresh the page and submit again. Use the same hostname throughout the session. '
+        'If this keeps happening, check the HTTPS/cookie configuration.</p>'
+        '<p><a href="/login">Return to login</a></p></body></html>'
+    )
+    from flask import make_response
+    return make_response(response, 400)
 
 csp = {
     'default-src': ["'self'"],
@@ -38,15 +83,22 @@ csp = {
     'img-src': ["'self'", "data:", "blob:"],
     'media-src': ["'self'", "blob:"]
 }
-talisman = Talisman(app, content_security_policy=csp, force_https=False)
-socketio = SocketIO(app, cors_allowed_origins=None, max_http_buffer_size=1_000_000)
+talisman = Talisman(
+    app, content_security_policy=csp, force_https=COOKIE_SECURE,
+    session_cookie_secure=COOKIE_SECURE,
+)
+# Explicit threading mode avoids silently selecting deprecated Eventlet. Install
+# simple-websocket to retain WebSocket transport under this mode.
+socketio = SocketIO(
+    app, async_mode='threading', cors_allowed_origins=None,
+    max_http_buffer_size=1_000_000,
+)
 
 online_users = {}
 user_status = {}
 live_streams = {}
 stream_viewers = {}
 
-ADMIN_DIR = 'famtube_admin'
 VIDEO_DIR = os.path.join(ADMIN_DIR, 'videos')
 THUMBNAIL_DIR = os.path.join(ADMIN_DIR, 'thumbnails')
 PROFILE_DIR = os.path.join(ADMIN_DIR, 'profiles')
