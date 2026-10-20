@@ -45,10 +45,16 @@
 
 ### 🎨 UI/UX
 - **Dark/Light mode** toggle with persistent cookie preference
-- **Responsive design** — works on mobile, tablet, and desktop
+- **Responsive, YouTube-inspired interface** — adaptive navigation, searchable header, video grids, and comfortable layouts across mobile, tablet, and desktop
 - **Real-time notifications** via WebSocket with browser push support
 - **Sidebar navigation** for quick access to all sections
 - **Toast notifications** for live alerts
+
+### 🧭 Interface and usability improvements
+- Desktop navigation stays visible with a collapsible sidebar; mobile navigation uses a bottom bar and an accessible slide-out menu.
+- Search can be opened directly from the mobile header, and the light/dark theme control is available from the main navigation.
+- Video player sizing, cards, form controls, tables, and notifications adapt to narrow screens and respect device safe areas.
+- Private/hidden video media is checked at the media endpoint as well as in page listings, and video-related APIs validate access before updating saves, history, or engagement.
 
 ### 🔒 Security
 - **CSRF Protection** on all forms
