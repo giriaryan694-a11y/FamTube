@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f0f0f">
+  <title>Offline · FamTube</title>
+  <style>
+    :root { color-scheme: dark light; font-family: system-ui, sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #0f0f0f; color: #f1f1f1; }
+    main { width: min(90%, 28rem); box-sizing: border-box; padding: 2rem; text-align: center; }
+    .mark { display: inline-grid; place-items: center; width: 4rem; height: 4rem; border-radius: 1rem; background: #ff0000; font-size: 2rem; }
+    h1 { margin: 1rem 0 .5rem; font-size: 1.6rem; }
+    p { color: #c7c7c7; line-height: 1.6; }
+    button { margin-top: 1rem; padding: .8rem 1.2rem; border: 0; border-radius: .6rem; background: #f1f1f1; color: #111; font: inherit; font-weight: 600; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark" aria-hidden="true">▶</div>
+    <h1>You’re offline</h1>
+    <p>FamTube needs a connection to load accounts, playlists, and videos. Reconnect to your FamTube server, then try again.</p>
+    <button type="button" onclick="location.reload()">Try again</button>
+  </main>
+</body>
+</html>
