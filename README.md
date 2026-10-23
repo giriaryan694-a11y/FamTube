@@ -7,7 +7,8 @@
 ## ✨ Features
 
 ### 📹 Video Sharing
-- Upload videos in **MP4, WEBM, or OGG** format 
+- Upload videos in **MP4, WEBM, or OGG** format
+- Automatically generate missing thumbnails from each video's first decodable frame (requires `ffmpeg` installed and available on `PATH`)
 - Add **titles, captions, and hashtags** for easy discovery
 - **Privacy controls**: Public or Private videos with allowed user lists
 - **Magic byte validation** to prevent fake file uploads
@@ -17,12 +18,18 @@
 - One-click start/stop with custom stream titles
 - Admin can **force-end streams** instantly
 
-> ⚠️ **HTTPS Required for Live Streaming**
-> Your browser blocks camera/microphone on HTTP (except localhost). Please:
-> - Access via `https://` (recommended)
-> - Or use `http://localhost:5000` only
+> ℹ️ **HTTP works for ordinary use on a trusted home network.**
+> You can run FamTube on a home PC/server and open `http://<server-LAN-IP>:5000` from your phone, tablet, or other home devices. By default, FamTube does not force HTTPS or send HSTS, so this mode does not get broken by transport-security redirects.
 >
-> Need HTTPS for local development? Use our companion tool [**http2https**](https://github.com/giriaryan694-a11y/http2https) to wrap your HTTP service with a local HTTPS reverse proxy and auto-generated TLS certificates.
+> **Important:** plain HTTP does not encrypt passwords, session cookies, or video traffic. Use it only on a trusted private LAN; do not expose port 5000 to the internet or use HTTP over public/untrusted Wi-Fi. Browser camera/microphone access for WebRTC live streaming still requires HTTPS, except when using `http://localhost:5000` on the same device.
+>
+> Need HTTPS for local or remote use? Use our companion tool [**http2https**](https://github.com/giriaryan694-a11y/http2https) for local development, or configure a properly managed HTTPS reverse proxy for a server deployment.
+
+### 📱 PWA and installation
+
+FamTube includes a web app manifest, 192×192 and 512×512 icons, and a privacy-conscious service worker. On a supported browser, open FamTube through HTTPS and use the browser's **Install app** or **Add to Home Screen** command. The installed app opens in a standalone window. When offline, it can show a generic reconnect page, but it does not store private pages, account data, video files, thumbnails, or API responses for offline access. Watching videos and using account features still requires the FamTube server and a network connection to it.
+
+**HTTP LAN compatibility is preserved:** FamTube continues to work as a normal website at `http://<server-LAN-IP>:5000` on trusted home networks. However, browsers restrict service workers and full PWA installation to secure origins (HTTPS, or `localhost`/loopback for local development). On a phone connecting to another device's LAN IP over HTTP, PWA installation/offline support will therefore be unavailable; this is a browser security rule, not an HTTPS redirect in FamTube. To install on multiple home devices, serve FamTube through HTTPS with a certificate each device trusts. Do not expose plain HTTP to the internet or untrusted Wi-Fi.
 
 ### 🔔 Social Features
 - **Subscribe** to family members and get notified of new uploads
@@ -46,6 +53,7 @@
 ### 🎨 UI/UX
 - **Light, Dark, and System themes** with a persistent cookie preference; theme selector is available on the login screen and authenticated pages, and System follows the device setting
 - **Responsive, YouTube-inspired interface** — adaptive navigation, searchable header, video grids, and comfortable layouts across mobile, tablet, and desktop
+- **PWA support** — installable app manifest, home-screen icons, standalone display, and a small offline fallback shell
 - **Real-time notifications** via WebSocket with browser push support
 - **Sidebar navigation** for quick access to all sections
 - **Toast notifications** for live alerts
@@ -226,13 +234,16 @@ famtube_admin/
 
 ## 🔐 Security Notes
 
-- **Always use HTTPS in production** — set `FAMTUBE_COOKIE_SECURE=1` and configure Flask-Talisman HTTPS enforcement at the correctly configured reverse proxy/app boundary
+- **HTTP is intentionally supported for trusted home-LAN use** — start FamTube on the host, then visit `http://<server-LAN-IP>:5000` from devices on the same private network. The built-in secure response headers do not force HTTPS in this default mode. Plain HTTP is not encrypted, so never expose this setup to the internet or use it on an untrusted network.
+- **PWA cache is deliberately narrow** — the service worker caches only the generic offline page and public app icons. It does not cache authenticated HTML, API calls, video media, thumbnails, uploads, or Socket.IO traffic, avoiding stale CSRF tokens and leakage of private content on shared devices. Full PWA features require HTTPS or local loopback as described above.
+- **Use HTTPS for internet-facing or untrusted-network deployments** — set `FAMTUBE_COOKIE_SECURE=1` only when the browser-facing origin genuinely uses HTTPS. This opts into Secure cookies, HTTPS redirects, and HSTS. If TLS terminates at a reverse proxy, configure the proxy/app HTTPS boundary correctly and have the proxy set HSTS only for HTTPS responses.
 - **Debug mode is disabled by the normal launcher** (`debug=False`, `use_reloader=False`); do not enable the interactive debugger on a network-accessible deployment
 - **The built-in launcher is for local/small deployments**; use a production-capable deployment setup and valid TLS for internet-facing hosting
-- **Socket.IO explicitly uses `threading` mode** instead of auto-selecting Eventlet, avoiding the Eventlet deprecation warning. Install `simple-websocket` so threading mode can support WebSocket transport: `pip install simple-websocket`.
+- **Socket.IO explicitly uses `threading` mode** and `simple-websocket` is included in `requirements.txt` for WebSocket transport.
 - **Change the default admin password immediately**
 - **Set `FAMTUBE_SECRET_KEY`** to a strong, stable secret in production and keep it identical across workers/instances. The development fallback is stored in `famtube_admin/.secret_key` so local restarts do not invalidate CSRF/session cookies. Back up and protect that file.
-- **Set `FAMTUBE_COOKIE_SECURE=1` on HTTPS deployments** so browsers only send the session cookie over HTTPS. The default is `0` for local plain-HTTP testing; never use that setting on an untrusted network or public deployment.
+- **`FAMTUBE_COOKIE_SECURE` defaults to `0`** to preserve plain-HTTP access on a trusted home LAN. Set it to `1` only for a correctly configured HTTPS deployment; doing so enables the Secure cookie flag and Talisman's HTTPS/HSTS behavior. Do not set it for plain-HTTP access.
+- **Response headers:** FamTube adds `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, and a restrictive CSP (including `object-src`, `base-uri`, and `frame-ancestors`). CSP still allows inline scripts/styles because the existing UI uses them; that remaining trade-off is documented in code. HSTS is TLS-only and disabled by default for HTTP compatibility.
 - **CSRF troubleshooting:** do not disable CSRF protection. Load the form with GET first, preserve cookies, use the same hostname consistently (for example, do not switch between `localhost` and `127.0.0.1`), avoid caching HTML that contains CSRF tokens, and keep the signing key stable across restarts/instances. Talisman's default `session_cookie_secure=True` can cause the browser to withhold the cookie over plain HTTP; FamTube now passes the explicit `FAMTUBE_COOKIE_SECURE` policy to Talisman so local HTTP and HTTPS production setups behave deliberately. The signing key is persisted in `famtube_admin/.secret_key` if `FAMTUBE_SECRET_KEY` is not set, so restarts do not invalidate every session and CSRF token. A custom CSRF error page gives recovery guidance without disabling protection.
 - **IP Filtering** is disabled by default — enable it from the Admin Dashboard when needed
 - All file uploads are validated by **magic bytes**, not just extensions
@@ -240,16 +251,23 @@ famtube_admin/
 
 ---
 
+## Runtime requirements
+
+Use Python 3.10 or newer and install the dependency requirements from `requirements.txt`. `ffmpeg` must also be installed and available on `PATH` for first-frame thumbnail generation.
+
+---
+
 ## 🧪 Testing
 
-Install the development/test dependencies and run the smoke suite:
+Run the standard-library regression suite from the repository root:
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest -q tests/
+python -m unittest discover -s tests -v
 ```
 
-The integration tests run FamTube in temporary directories to avoid changing your real user/video data. They validate login CSRF handling, stable signing-key behavior across restarts, template compilation, and the selected Socket.IO mode.
+The tests use temporary directories and do not initialize or modify your real FamTube data. They cover path traversal checks, atomic JSON writes, the IP-filter denial path, video-signature validation, and generation of a missing thumbnail from the actual first frame. The thumbnail regression test is skipped automatically when `ffmpeg` is unavailable.
+
+For a quick syntax check of the application itself, run `python -m py_compile main.py`. Install `requirements.txt` before launching the full web application.
 
 ---
 
