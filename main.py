@@ -6,6 +6,7 @@ import secrets
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from functools import wraps
 from flask import Flask, request, session, redirect, url_for, render_template, jsonify, abort, send_from_directory, g
@@ -76,15 +77,37 @@ def handle_csrf_error(error):
     from flask import make_response
     return make_response(response, 400)
 
+# Security headers are designed to work on both trusted home-LAN HTTP and
+# HTTPS deployments. Do not use `upgrade-insecure-requests`: it would break the
+# explicitly supported plain-HTTP LAN mode. Inline script/style allowances remain
+# necessary for the current UI; unsafe-inline should be removed in a future nonce
+# migration rather than pretending the current templates are nonce-ready.
 csp = {
     'default-src': ["'self'"],
-    'script-src': ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+    'base-uri': ["'self'"],
+    'object-src': ["'none'"],
+    'frame-ancestors': ["'none'"],
+    'form-action': ["'self'"],
+    'script-src': ["'self'", "'unsafe-inline'", 'https://cdnjs.cloudflare.com'],
     'style-src': ["'self'", "'unsafe-inline'"],
-    'img-src': ["'self'", "data:", "blob:"],
-    'media-src': ["'self'", "blob:"]
+    'img-src': ["'self'", 'data:', 'blob:'],
+    'media-src': ["'self'", 'blob:'],
+    # Socket.IO may use WebSocket transport; polling/fetch stays same-origin.
+    'connect-src': ["'self'", 'ws:', 'wss:'],
 }
 talisman = Talisman(
-    app, content_security_policy=csp, force_https=COOKIE_SECURE,
+    app,
+    content_security_policy=csp,
+    force_https=COOKIE_SECURE,
+    # Never force HTTPS or enable HSTS by default: home-LAN HTTP is supported.
+    # Setting FAMTUBE_COOKIE_SECURE=1 opts into HTTPS-only cookies, redirects,
+    # and HSTS for deployments that really are served over HTTPS.
+    strict_transport_security=COOKIE_SECURE,
+    strict_transport_security_max_age=31536000,
+    strict_transport_security_include_subdomains=False,
+    strict_transport_security_preload=False,
+    frame_options='DENY',
+    referrer_policy='strict-origin-when-cross-origin',
     session_cookie_secure=COOKIE_SECURE,
 )
 # Explicit threading mode avoids silently selecting deprecated Eventlet. Install
@@ -119,62 +142,162 @@ SUBS_FILE = os.path.join(ADMIN_DIR, 'subscriptions.json')
 
 ALLOWED_EXTENSIONS = {'mp4', 'webm', 'ogg'}
 ALLOWED_PICS = {'png', 'jpg', 'jpeg', 'webp'}
-USERNAME_REGEX = re.compile(r'^[a-zA-Z0-9_]{3,30}$')
+USERNAME_REGEX = re.compile(r'[a-zA-Z0-9_]{3,30}')
 
 for d in [ADMIN_DIR, VIDEO_DIR, THUMBNAIL_DIR, PROFILE_DIR, BACKUP_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
 def allowed_file(filename, allowed_set):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_set
+    return isinstance(filename, str) and '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_set
+
+def request_json_object():
+    """Return only JSON objects; lists/scalars/malformed JSON become an empty object."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+# JSON-backed storage is intentionally simple, but atomic replacement prevents readers
+# from observing partially-written files when threaded requests overlap.
+_JSON_WRITE_LOCK = threading.RLock()
 
 def load_json(filepath):
-    if not os.path.exists(filepath): return {}
+    if not os.path.exists(filepath):
+        return {}
     try:
-        with open(filepath, 'r', encoding='utf-8') as f: return json.load(f)
-    except (json.JSONDecodeError, IOError, PermissionError): return {}
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
 
 def save_json(filepath, data):
-    with open(filepath, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
+    """Persist JSON atomically so a crash cannot truncate an application's data file."""
+    directory = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    temp_path = None
+    with _JSON_WRITE_LOCK:
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix='.famtube-', suffix='.tmp', dir=directory)
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, filepath)
+            temp_path = None
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 def extract_thumbnail(video_path, thumbnail_path):
+    """Extract the first decodable video frame and re-encode it as a clean JPEG."""
     try:
-        cmd = ['ffmpeg', '-i', video_path, '-ss', '00:00:01', '-vframes', '1', '-vf', 'scale=320:180', thumbnail_path, '-y']
-        subprocess.run(cmd, capture_output=True, timeout=10)
-        return os.path.exists(thumbnail_path)
-    except Exception: return False
+        if not os.path.isfile(video_path):
+            return False
+        # Remove a stale/partial thumbnail before attempting a fresh extraction.
+        try:
+            os.remove(thumbnail_path)
+        except FileNotFoundError:
+            pass
+        cmd = [
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-threads', '1',
+            '-i', video_path, '-map', '0:v:0', '-frames:v', '1',
+            '-vf', 'scale=320:180:force_original_aspect_ratio=decrease,'
+                  'pad=320:180:(ow-iw)/2:(oh-ih)/2,setsar=1',
+            '-q:v', '3', '-f', 'image2', '-y', thumbnail_path,
+        ]
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10, check=False)
+        return (result.returncode == 0 and os.path.isfile(thumbnail_path)
+                and os.path.getsize(thumbnail_path) > 0
+                and validate_file_content(thumbnail_path, 'image'))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        try:
+            if os.path.exists(thumbnail_path):
+                os.remove(thumbnail_path)
+        except OSError:
+            pass
+        return False
 
 def generate_thumbnail(video_filename):
-    video_path = os.path.join(VIDEO_DIR, video_filename)
+    if not safe_filename_check(video_filename):
+        return None
+    video_root = os.path.abspath(VIDEO_DIR)
+    video_path = os.path.abspath(os.path.join(video_root, video_filename))
+    if os.path.commonpath([video_root, video_path]) != video_root:
+        return None
     thumb_name = video_filename.rsplit('.', 1)[0] + '.jpg'
-    thumb_path = os.path.join(THUMBNAIL_DIR, thumb_name)
-    if os.path.exists(video_path) and extract_thumbnail(video_path, thumb_path): return thumb_name
+    if not safe_filename_check(thumb_name):
+        return None
+    thumb_root = os.path.abspath(THUMBNAIL_DIR)
+    thumb_path = os.path.abspath(os.path.join(thumb_root, thumb_name))
+    if os.path.commonpath([thumb_root, thumb_path]) != thumb_root:
+        return None
+    if os.path.isfile(video_path) and extract_thumbnail(video_path, thumb_path):
+        return thumb_name
     return None
 
 def generate_missing_thumbnails():
-    videos = load_json(VIDEOS_FILE); updated = False
-    for vid, v in videos.items():
-        if not v.get('thumbnail') or not os.path.exists(os.path.join(THUMBNAIL_DIR, v['thumbnail'])):
-            thumb = generate_thumbnail(v['filename'])
-            if thumb: v['thumbnail'] = thumb; updated = True
-    if updated: save_json(VIDEOS_FILE, videos)
+    """Backfill absent thumbnails without trusting metadata filenames or root types."""
+    videos = load_json(VIDEOS_FILE)
+    if not isinstance(videos, dict):
+        return
+    updated = False
+    for video_id, video in videos.items():
+        if not isinstance(video, dict):
+            continue
+        filename = video.get('filename')
+        if not safe_filename_check(filename):
+            continue
+        thumbnail = video.get('thumbnail')
+        thumbnail_path = local_media_path(THUMBNAIL_DIR, thumbnail)
+        thumbnail_exists = (
+            thumbnail_path is not None
+            and os.path.isfile(thumbnail_path)
+            and validate_file_content(thumbnail_path, 'image')
+        )
+        if thumbnail_exists:
+            continue
+        generated = generate_thumbnail(filename)
+        if generated:
+            video['thumbnail'] = generated
+            updated = True
+    if updated:
+        save_json(VIDEOS_FILE, videos)
 
 def log_activity(action, username="Guest"):
     try:
         logs = load_json(LOGS_FILE)
-        logs.append({"timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ip": request.remote_addr, "user_agent": request.headers.get('User-Agent'), "username": username, "action": action})
-        save_json(LOGS_FILE, logs)
-    except Exception: pass
+        if not isinstance(logs, list):
+            logs = []
+        logs.append({"timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ip": request.remote_addr, "user_agent": request.headers.get('User-Agent', '')[:300], "username": str(username)[:30], "action": str(action)[:120]})
+        save_json(LOGS_FILE, logs[-5000:])
+    except Exception:
+        pass
 
 def notify_user(target_username, message, link, sender=None):
-    if not is_valid_username(target_username): return
+    if not is_valid_username(target_username):
+        return
+    if not isinstance(link, str) or not link.startswith('/') or link.startswith('//'):
+        link = '/'
     notifs = load_json(NOTIFS_FILE)
-    if target_username not in notifs: notifs[target_username] = []
+    if not isinstance(notifs, dict):
+        notifs = {}
+    existing = notifs.get(target_username, [])
+    if not isinstance(existing, list):
+        existing = []
     notif_obj = {"id": str(uuid.uuid4()), "message": str(message)[:200], "link": link, "read": False, "timestamp": datetime.datetime.now().strftime("%H:%M"), "sender": sender}
-    notifs[target_username].insert(0, notif_obj)
+    notifs[target_username] = [notif_obj] + existing[:499]
     save_json(NOTIFS_FILE, notifs)
     if target_username in online_users:
-        try: socketio.emit('receive_notification', notif_obj, to=online_users[target_username])
-        except Exception: pass
+        try:
+            socketio.emit('receive_notification', notif_obj, to=online_users[target_username])
+        except Exception:
+            pass
 
 def can_view_video(v, user, role):
     """Return whether the current account may view a video's metadata and media."""
@@ -192,34 +315,137 @@ def can_view_video(v, user, role):
 
 def is_valid_username(username):
     if not username or not isinstance(username, str): return False
-    return bool(USERNAME_REGEX.match(username))
+    return bool(USERNAME_REGEX.fullmatch(username))
 
 def validate_file_content(filepath, expected_type):
+    """Validate file signatures and ensure they match the served file extension."""
     try:
-        with open(filepath, 'rb') as f: header = f.read(16)
-        if expected_type == 'image': return (header.startswith(b'\x89PNG\r\n\x1a\n') or header.startswith(b'\xff\xd8\xff') or (header.startswith(b'RIFF') and header[8:12] == b'WEBP'))
-        elif expected_type == 'video':
-            if header.startswith(b'\x1a\x45\xdf\xa3') or header.startswith(b'OggS'): return True
-            if len(header) >= 8 and header[4:8] in (b'ftyp', b'moov', b'mdat', b'free', b'skip', b'wide', b'pnot'): return True
+        if not os.path.isfile(filepath) or os.path.getsize(filepath) < 16:
             return False
+        extension = os.path.splitext(filepath)[1].lower()
+        with open(filepath, 'rb') as f:
+            header = f.read(32)
+
+        if expected_type == 'image':
+            if extension in ('.jpg', '.jpeg'):
+                return header.startswith(b'\xff\xd8\xff')
+            if extension == '.png':
+                return header.startswith(b'\x89PNG\r\n\x1a\n')
+            if extension == '.webp':
+                return header.startswith(b'RIFF') and header[8:12] == b'WEBP'
+            return False
+
+        if expected_type == 'video':
+            if extension == '.webm':
+                return header.startswith(b'\x1a\x45\xdf\xa3')
+            if extension == '.ogg':
+                return header.startswith(b'OggS')
+            if extension != '.mp4' or len(header) < 12 or header[4:8] != b'ftyp':
+                return False
+
+            # ISO-BMFF files should begin with an ftyp box; accepting arbitrary
+            # later box names lets unrelated files masquerade as MP4 uploads.
+            box_size = int.from_bytes(header[:4], 'big')
+            actual_size = os.path.getsize(filepath)
+            if box_size == 1:
+                extended_size = int.from_bytes(header[8:16], 'big') if len(header) >= 16 else 0
+                return extended_size >= 16 and extended_size <= actual_size
+            return box_size >= 8 and box_size <= actual_size
+
         return False
-    except Exception: return False
+    except (OSError, ValueError):
+        return False
 
 def safe_filename_check(filename):
-    if not filename or '..' in filename or filename.startswith('/') or filename.startswith('\\'): return False
-    return True
+    # Accept only a single filename component, never a path or NUL-containing value.
+    if not isinstance(filename, str) or not filename or filename in {'.', '..'}:
+        return False
+    if any(ord(char) < 32 for char in filename) or ':' in filename:
+        return False
+    if '/' in filename or chr(92) in filename:
+        return False
+    return os.path.basename(filename) == filename
+
+def local_media_path(directory, filename):
+    # Resolve an approved basename beneath a configured media directory.
+    if not safe_filename_check(filename):
+        return None
+    root = os.path.abspath(directory)
+    path = os.path.abspath(os.path.join(root, filename))
+    try:
+        if os.path.commonpath([root, path]) != root:
+            return None
+    except ValueError:
+        return None
+    return path
+
+def remove_local_media(directory, filename):
+    path = local_media_path(directory, filename)
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 def revoke_all_user_sessions(username):
     sessions = load_json(SESSIONS_FILE)
-    to_remove = [sid for sid, sdata in sessions.items() if sdata.get('username') == username]
-    for sid in to_remove: del sessions[sid]
+    if not isinstance(sessions, dict):
+        sessions = {}
+    to_remove = [sid for sid, sdata in sessions.items()
+                 if isinstance(sdata, dict) and sdata.get('username') == username]
+    for sid in to_remove:
+        del sessions[sid]
     save_json(SESSIONS_FILE, sessions)
 
+def remove_video_references(video_id):
+    # Remove stale references after a video is permanently deleted.
+    comments = load_json(COMMENTS_FILE)
+    if isinstance(comments, dict):
+        comments.pop(video_id, None)
+        save_json(COMMENTS_FILE, comments)
+
+    saved = load_json(SAVED_FILE)
+    if isinstance(saved, dict):
+        for owner, entries in list(saved.items()):
+            if isinstance(entries, list):
+                saved[owner] = [entry for entry in entries if entry != video_id]
+        save_json(SAVED_FILE, saved)
+
+    history = load_json(HISTORY_FILE)
+    if isinstance(history, dict):
+        for owner, entries in list(history.items()):
+            if isinstance(entries, list):
+                history[owner] = [entry for entry in entries
+                                  if not isinstance(entry, dict) or entry.get('video_id') != video_id]
+        save_json(HISTORY_FILE, history)
+
+    engagement = load_json(ENGAGE_FILE)
+    if isinstance(engagement, dict):
+        for owner, watched in engagement.items():
+            if isinstance(watched, dict):
+                watched.pop(video_id, None)
+        save_json(ENGAGE_FILE, engagement)
+
+    playlists = load_json(PLAYLISTS_FILE)
+    if isinstance(playlists, dict):
+        for playlist in playlists.values():
+            if isinstance(playlist, dict) and isinstance(playlist.get('videos'), list):
+                playlist['videos'] = [entry for entry in playlist['videos'] if entry != video_id]
+        save_json(PLAYLISTS_FILE, playlists)
+
 def get_max_upload_bytes():
-    config = load_json(CONFIG_FILE); size = config.get('max_upload_size', 1); unit = config.get('max_upload_unit', 'GB')
-    if size == 0: return 0
-    multipliers = {'MB': 1024*1024, 'GB': 1024*1024*1024, 'TB': 1024*1024*1024*1024}
-    return size * multipliers.get(unit, 1024*1024*1024)
+    config = load_json(CONFIG_FILE)
+    try:
+        size = max(0, int(config.get('max_upload_size', 1)))
+    except (TypeError, ValueError):
+        size = 1
+    unit = config.get('max_upload_unit', 'GB')
+    if unit not in ('MB', 'GB', 'TB'):
+        unit = 'GB'
+    if size == 0:
+        return 0
+    multipliers = {'MB': 1024 ** 2, 'GB': 1024 ** 3, 'TB': 1024 ** 4}
+    return size * multipliers[unit]
 
 def update_max_content_length():
     max_bytes = get_max_upload_bytes()
@@ -309,39 +535,122 @@ def rename_user_references(old_username, new_username):
 # ==================== SECURITY MIDDLEWARE ====================
 @app.before_request
 def security_checks():
-    if request.endpoint in ('static', 'login', None): return
-    try:
-        config = load_json(CONFIG_FILE)
-        if config.get('ip_filter_enabled'):
-            client_ip = request.remote_addr or '127.0.0.1'
-            if client_ip in config.get('blocked_ips', []): abort(403)
-            if config.get('strict_allowlist_mode') and client_ip not in config.get('allowed_ips', []): abort(403)
-    except Exception: pass
+    # Static assets and the login page remain reachable so users can sign in.
+    # Do not wrap abort(403) in a broad exception handler: HTTPException is an
+    # Exception too, so the old handler accidentally swallowed every IP denial.
+    if request.endpoint in ('static', 'login'):
+        return
+
+    config = load_json(CONFIG_FILE)
+    if not isinstance(config, dict) or not config.get('ip_filter_enabled'):
+        return
+
+    client_ip = request.remote_addr or '127.0.0.1'
+    blocked_ips = config.get('blocked_ips', [])
+    allowed_ips = config.get('allowed_ips', [])
+    if not isinstance(blocked_ips, list):
+        blocked_ips = []
+    if not isinstance(allowed_ips, list):
+        allowed_ips = []
+
+    if client_ip in blocked_ips:
+        abort(403)
+    if config.get('strict_allowlist_mode') and client_ip not in allowed_ips:
+        abort(403)
 
 @app.after_request
-def add_permissions_policy(response):
-    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(self)'
+def add_security_headers(response):
+    # These headers are useful even when the app is served over plain HTTP.
+    # TLS-only HSTS is managed by Talisman and is enabled only when HTTPS mode
+    # is explicitly configured; emitting HSTS for an HTTP LAN origin is harmful.
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['X-Permitted-Cross-Domain-Policies'] = 'none'
+    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(self), geolocation=()'
+    return response
+
+# Serve the worker from the origin root so its scope can cover every FamTube page.
+# Static content is rooted relative to this module rather than the shell's CWD.
+PWA_ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+
+@app.route('/manifest.webmanifest', methods=['GET'])
+def pwa_manifest():
+    response = send_from_directory(
+        PWA_ASSET_DIR, 'manifest.webmanifest',
+        mimetype='application/manifest+json', max_age=0
+    )
+    response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return response
+
+@app.route('/service-worker.js', methods=['GET'])
+def pwa_service_worker():
+    response = send_from_directory(
+        PWA_ASSET_DIR, 'service-worker.js',
+        mimetype='application/javascript', max_age=0
+    )
+    response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    response.headers['Service-Worker-Allowed'] = '/'
     return response
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if 'session_id' not in session or 'username' not in session: session.clear(); return redirect(url_for('login'))
+        username = session.get('username')
+        session_id = session.get('session_id')
+        if not session_id or not is_valid_username(username):
+            session.clear()
+            return redirect(url_for('login'))
         users = load_json(USERS_FILE)
-        if not is_valid_username(session['username']) or session['username'] not in users: session.clear(); return redirect(url_for('login'))
+        user_data = users.get(username) if isinstance(users, dict) else None
+        if not isinstance(user_data, dict):
+            session.clear()
+            return redirect(url_for('login'))
         sessions = load_json(SESSIONS_FILE)
-        if session['session_id'] not in sessions: session.clear(); return redirect(url_for('login'))
+        server_session = sessions.get(session_id) if isinstance(sessions, dict) else None
+        # Match the signed cookie to the server-side session record. This makes
+        # revocation effective and avoids trusting stale role data in the cookie.
+        if not isinstance(server_session, dict) or server_session.get('username') != username:
+            session.clear()
+            return redirect(url_for('login'))
+        current_role = user_data.get('role', 'user')
+        session['role'] = current_role if current_role in ('user', 'admin') else 'user'
         return f(*args, **kwargs)
     return decorated_function
 
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if session.get('role') != 'admin': abort(403)
+        username = session.get('username')
+        session_id = session.get('session_id')
         users = load_json(USERS_FILE)
-        if session.get('username') not in users: session.clear(); return redirect(url_for('login'))
+        sessions = load_json(SESSIONS_FILE)
+        user_data = users.get(username) if isinstance(users, dict) else None
+        server_session = sessions.get(session_id) if isinstance(sessions, dict) else None
+        if (not isinstance(user_data, dict) or not isinstance(server_session, dict)
+                or server_session.get('username') != username):
+            session.clear()
+            return redirect(url_for('login'))
+        if user_data.get('role') != 'admin':
+            abort(403)
+        session['role'] = 'admin'
         return f(*args, **kwargs)
     return decorated_function
+
+def authenticated_socket_username():
+    # Return a username only if the server-side session is still live.
+    username = session.get('username')
+    session_id = session.get('session_id')
+    if not is_valid_username(username) or not isinstance(session_id, str):
+        return None
+    users = load_json(USERS_FILE)
+    sessions = load_json(SESSIONS_FILE)
+    server_session = sessions.get(session_id) if isinstance(sessions, dict) else None
+    if (not isinstance(users, dict) or username not in users
+            or not isinstance(server_session, dict)
+            or server_session.get('username') != username):
+        return None
+    return username
 
 def init_db(filepath, default_data):
     if not os.path.exists(filepath):
@@ -413,7 +722,7 @@ def login():
         else: error_msg = "Invalid username or password."; log_activity('failed_login', username or 'Guest')
     return render_template('login.html', error_msg=error_msg)
 
-@app.route('/logout')
+@app.route('/logout', methods=['POST'])
 def logout():
     if 'session_id' in session: sessions = load_json(SESSIONS_FILE); sessions.pop(session.get('session_id'), None); save_json(SESSIONS_FILE, sessions)
     session.clear(); return redirect(url_for('login'))
@@ -496,9 +805,21 @@ def upload():
             if 'thumbnail' in request.files:
                 thumb_file = request.files['thumbnail']
                 if thumb_file and thumb_file.filename and allowed_file(thumb_file.filename, ALLOWED_PICS):
-                    thumb_filename = secure_filename(thumb_file.filename); thumb_unique = f"{uuid.uuid4().hex}_{thumb_filename}"; thumb_path = os.path.join(THUMBNAIL_DIR, thumb_unique); thumb_file.save(thumb_path)
-                    if validate_file_content(thumb_path, 'image'): thumbnail = thumb_unique
-                    else: os.remove(thumb_path)
+                    try:
+                        thumb_file.seek(0, os.SEEK_END)
+                        thumb_size = thumb_file.tell()
+                        thumb_file.seek(0)
+                    except (OSError, AttributeError):
+                        thumb_size = 5 * 1024 * 1024 + 1
+                    if 0 < thumb_size <= 5 * 1024 * 1024:
+                        thumb_filename = secure_filename(thumb_file.filename)
+                        thumb_unique = f"{uuid.uuid4().hex}_{thumb_filename}"
+                        thumb_path = os.path.join(THUMBNAIL_DIR, thumb_unique)
+                        thumb_file.save(thumb_path)
+                        if validate_file_content(thumb_path, 'image'):
+                            thumbnail = thumb_unique
+                        else:
+                            remove_local_media(THUMBNAIL_DIR, thumb_unique)
             if not thumbnail: thumbnail = generate_thumbnail(unique_name)
             
             videos = load_json(VIDEOS_FILE); video_id = str(uuid.uuid4())
@@ -550,11 +871,20 @@ def user_profile(username):
     
     if request.method == 'POST':
         action = request.form.get('action'); target = request.form.get('target_user')
-        if action in ['subscribe', 'unsubscribe'] and target and is_valid_username(target):
-            current = session['username']; user_subs = subs.get(current, [])
-            if action == 'subscribe' and target not in user_subs: user_subs.append(target); notify_user(target, f"{current} subscribed to you!", f"/user/{current}", sender=current)
-            elif action == 'unsubscribe' and target in user_subs: user_subs.remove(target)
-            subs[current] = user_subs; save_json(SUBS_FILE, subs); return redirect(url_for('user_profile', username=username))
+        if (action in ['subscribe', 'unsubscribe'] and target and is_valid_username(target)
+                and isinstance(users, dict) and target in users and target != session['username']):
+            current = session['username']
+            user_subs = subs.get(current, [])
+            if not isinstance(user_subs, list):
+                user_subs = []
+            if action == 'subscribe' and target not in user_subs:
+                user_subs.append(target)
+                notify_user(target, f"{current} subscribed to you!", f"/user/{current}", sender=current)
+            elif action == 'unsubscribe' and target in user_subs:
+                user_subs.remove(target)
+            subs[current] = user_subs
+            save_json(SUBS_FILE, subs)
+            return redirect(url_for('user_profile', username=username))
             
     user_videos = []
     for vid, v in videos.items():
@@ -580,9 +910,24 @@ def settings():
             if 'profile_pic' in request.files:
                 file = request.files['profile_pic']
                 if file and file.filename and allowed_file(file.filename, ALLOWED_PICS):
-                    filename = secure_filename(file.filename); unique_name = f"{uuid.uuid4().hex}_{filename}"; filepath = os.path.join(PROFILE_DIR, unique_name); file.save(filepath)
-                    if validate_file_content(filepath, 'image'): user_data['profile_pic'] = unique_name
-                    else: os.remove(filepath); error_msg = "Invalid image file."
+                    try:
+                        file.seek(0, os.SEEK_END)
+                        file_size = file.tell()
+                        file.seek(0)
+                    except (OSError, AttributeError):
+                        file_size = 5 * 1024 * 1024 + 1
+                    if file_size <= 0 or file_size > 5 * 1024 * 1024:
+                        error_msg = "Profile image must be 5 MB or smaller."
+                    else:
+                        filename = secure_filename(file.filename)
+                        unique_name = f"{uuid.uuid4().hex}_{filename}"
+                        filepath = os.path.join(PROFILE_DIR, unique_name)
+                        file.save(filepath)
+                        if validate_file_content(filepath, 'image'):
+                            user_data['profile_pic'] = unique_name
+                        else:
+                            remove_local_media(PROFILE_DIR, unique_name)
+                            error_msg = "Invalid image file."
             if not error_msg: update_user_data(username, user_data); success_msg = "Profile updated!"; log_activity('update_profile', username)
         elif action == 'toggle_privacy': user_data['hide_last_seen'] = request.form.get('hide_last_seen') == 'yes'; update_user_data(username, user_data); success_msg = "Privacy settings saved."
         elif action == 'toggle_device_notif': user_data['device_notif_enabled'] = request.form.get('device_notif') == 'yes'; update_user_data(username, user_data); success_msg = "Notification settings saved."
@@ -722,10 +1067,19 @@ def admin_dashboard():
             config['ip_filter_enabled'] = request.form.get('ip_filter_enabled') == 'yes'; config['strict_allowlist_mode'] = request.form.get('strict_allowlist_mode') == 'yes'
             config['blocked_ips'] = [ip.strip() for ip in request.form.get('blocked_ips', '').split('\n') if ip.strip()]; config['allowed_ips'] = [ip.strip() for ip in request.form.get('allowed_ips', '').split('\n') if ip.strip()]
             save_json(CONFIG_FILE, config); log_activity('update_ip_filter', session['username'])
-        elif action == 'update_upload_settings': 
-            try: size = max(0, int(request.form.get('max_upload_size', 1)))
-            except: size = 1
-            unit = request.form.get('max_upload_unit', 'GB'); config['max_upload_size'] = size; config['max_upload_unit'] = unit; save_json(CONFIG_FILE, config); update_max_content_length(); return redirect(url_for('admin_dashboard', msg='Upload settings updated', msg_type='success'))
+        elif action == 'update_upload_settings':
+            try:
+                size = max(0, int(request.form.get('max_upload_size', 1)))
+            except (TypeError, ValueError):
+                size = 1
+            unit = request.form.get('max_upload_unit', 'GB')
+            if unit not in ('MB', 'GB', 'TB'):
+                unit = 'GB'
+            config['max_upload_size'] = size
+            config['max_upload_unit'] = unit
+            save_json(CONFIG_FILE, config)
+            update_max_content_length()
+            return redirect(url_for('admin_dashboard', msg='Upload settings updated', msg_type='success'))
         elif action == 'kill_stream':  
             target = request.form.get('target_user')
             if target and is_valid_username(target) and target in live_streams:
@@ -744,21 +1098,11 @@ def admin_dashboard():
                 video_entry = videos[vid]
                 filename = video_entry.get('filename')
                 thumbnail = video_entry.get('thumbnail')
-                if filename and safe_filename_check(filename) and os.path.exists(os.path.join(VIDEO_DIR, filename)):
-                    os.remove(os.path.join(VIDEO_DIR, filename))
-                if thumbnail and safe_filename_check(thumbnail) and os.path.exists(os.path.join(THUMBNAIL_DIR, thumbnail)):
-                    os.remove(os.path.join(THUMBNAIL_DIR, thumbnail))
+                remove_local_media(VIDEO_DIR, filename)
+                remove_local_media(THUMBNAIL_DIR, thumbnail)
                 del videos[vid]
                 save_json(VIDEOS_FILE, videos)
-                comments = load_json(COMMENTS_FILE); comments.pop(vid, None); save_json(COMMENTS_FILE, comments)
-                for filepath in (SAVED_FILE, HISTORY_FILE):
-                    data = load_json(filepath)
-                    for owner, entries in data.items():
-                        if filepath == SAVED_FILE and isinstance(entries, list):
-                            data[owner] = [entry for entry in entries if entry != vid]
-                        elif filepath == HISTORY_FILE and isinstance(entries, list):
-                            data[owner] = [entry for entry in entries if entry.get('video_id') != vid]
-                    save_json(filepath, data)
+                remove_video_references(vid)
         elif action == 'revoke_session': 
             sid = request.form.get('revoke_sid')
             if sid and sid in sessions: sessions.pop(sid, None); save_json(SESSIONS_FILE, sessions)
@@ -788,25 +1132,132 @@ def admin_dashboard():
                     if len(new_pass) < 6: return redirect(url_for('admin_dashboard', msg='Password too short', msg_type='error'))
                     user_data['password_hash'] = generate_password_hash(new_pass); revoke_all_user_sessions(original)
                 user_data['feed_preference'] = preference; users[original] = user_data; save_json(USERS_FILE, users); return redirect(url_for('admin_dashboard', msg=f'User {original} updated', msg_type='success'))
-        elif action == 'delete_user': 
-            target = request.form.get('del_user'); mode = request.form.get('delete_mode', 'backup')
+        elif action == 'delete_user':
+            target = request.form.get('del_user')
+            mode = request.form.get('delete_mode', 'backup')
             if target and is_valid_username(target) and target in users and target != 'admin':
-                if mode in ['backup', 'delete_videos']:
-                    for vid, v in list(videos.items()):
-                        if v['uploader'] == target:
-                            if mode == 'backup':
-                                if safe_filename_check(v['filename']) and os.path.exists(os.path.join(VIDEO_DIR, v['filename'])): 
-                                    os.makedirs(os.path.join(BACKUP_DIR, secure_filename(target)), exist_ok=True)
-                                    shutil.copy2(os.path.join(VIDEO_DIR, v['filename']), os.path.join(BACKUP_DIR, secure_filename(target)))
-                            elif mode == 'delete_videos':
-                                if safe_filename_check(v['filename']) and os.path.exists(os.path.join(VIDEO_DIR, v['filename'])): os.remove(os.path.join(VIDEO_DIR, v['filename']))
-                            del videos[vid]
+                owned_videos = [(vid, entry) for vid, entry in list(videos.items())
+                                if isinstance(entry, dict) and entry.get('uploader') == target]
+                if mode not in ('backup', 'delete_videos', 'keep_videos'):
+                    return redirect(url_for('admin_dashboard', msg='Invalid deletion mode', msg_type='error'))
+
+                backup_stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_dir = os.path.join(BACKUP_DIR, f"{secure_filename(target)}_{backup_stamp}_{uuid.uuid4().hex[:8]}")
+                manifest = {}
+                if mode == 'backup':
+                    try:
+                        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+                        for vid, entry in owned_videos:
+                            filename = entry.get('filename')
+                            thumb = entry.get('thumbnail')
+                            source = local_media_path(VIDEO_DIR, filename)
+                            if source and os.path.isfile(source):
+                                shutil.copy2(source, os.path.join(backup_dir, filename))
+                            thumb_source = local_media_path(THUMBNAIL_DIR, thumb)
+                            if thumb_source and os.path.isfile(thumb_source):
+                                shutil.copy2(thumb_source, os.path.join(backup_dir, thumb))
+                            manifest[vid] = {key: entry.get(key) for key in (
+                                'title', 'captions', 'hashtags', 'privacy', 'allowed_users',
+                                'uploader', 'filename', 'thumbnail', 'timestamp', 'visibility'
+                            )}
+                        save_json(os.path.join(backup_dir, 'manifest.json'), manifest)
+                    except OSError:
+                        return redirect(url_for('admin_dashboard', msg='Backup failed; user was not deleted', msg_type='error'))
+
+                if mode in ('backup', 'delete_videos'):
+                    for vid, entry in owned_videos:
+                        remove_local_media(VIDEO_DIR, entry.get('filename'))
+                        remove_local_media(THUMBNAIL_DIR, entry.get('thumbnail'))
+                        videos.pop(vid, None)
+                        remove_video_references(vid)
                     save_json(VIDEOS_FILE, videos)
-                elif mode == 'keep_videos':
-                    for v in videos.values(): 
-                        if v['uploader'] == target: v['uploader'] = 'deleted_user'
+                else:  # keep_videos
+                    for entry in videos.values():
+                        if isinstance(entry, dict) and entry.get('uploader') == target:
+                            entry['uploader'] = 'deleted_user'
+                            allowed = entry.get('allowed_users', '')
+                            if isinstance(allowed, str):
+                                entry['allowed_users'] = ', '.join(
+                                    name.strip() for name in allowed.split(',')
+                                    if name.strip() and name.strip() != target
+                                )
                     save_json(VIDEOS_FILE, videos)
-                revoke_all_user_sessions(target); online_users.pop(target, None); user_status.pop(target, None); live_streams.pop(target, None); del users[target]; save_json(USERS_FILE, users); return redirect(url_for('admin_dashboard', msg=f'User {target} deleted', msg_type='success'))
+
+                subscriptions = load_json(SUBS_FILE)
+                if isinstance(subscriptions, dict):
+                    subscriptions.pop(target, None)
+                    for owner, followed in list(subscriptions.items()):
+                        if isinstance(followed, list):
+                            subscriptions[owner] = [name for name in followed if name != target]
+                    save_json(SUBS_FILE, subscriptions)
+
+                for filepath in (ENGAGE_FILE, SAVED_FILE, HISTORY_FILE, NOTIFS_FILE):
+                    data = load_json(filepath)
+                    if isinstance(data, dict):
+                        data.pop(target, None)
+                        if filepath == NOTIFS_FILE:
+                            for owner, entries in list(data.items()):
+                                if isinstance(entries, list):
+                                    data[owner] = [entry for entry in entries
+                                                   if not isinstance(entry, dict) or entry.get('sender') != target]
+                        save_json(filepath, data)
+
+                playlists = load_json(PLAYLISTS_FILE)
+                if isinstance(playlists, dict):
+                    playlists = {pid: playlist for pid, playlist in playlists.items()
+                                 if not isinstance(playlist, dict) or playlist.get('owner') != target}
+                    save_json(PLAYLISTS_FILE, playlists)
+
+                comments_db = load_json(COMMENTS_FILE)
+                def remove_deleted_user_comments(items):
+                    if not isinstance(items, list):
+                        return []
+                    retained = []
+                    for comment in items:
+                        if not isinstance(comment, dict) or comment.get('user') == target:
+                            continue
+                        likes = comment.get('likes', [])
+                        if isinstance(likes, list):
+                            comment['likes'] = [name for name in likes if name != target]
+                        if isinstance(comment.get('replies'), list):
+                            comment['replies'] = remove_deleted_user_comments(comment['replies'])
+                        retained.append(comment)
+                    return retained
+                if isinstance(comments_db, dict):
+                    for vid, entries in list(comments_db.items()):
+                        comments_db[vid] = remove_deleted_user_comments(entries)
+                    save_json(COMMENTS_FILE, comments_db)
+
+                # Revoke access to private videos if this username is registered again later.
+                videos = load_json(VIDEOS_FILE)
+                if isinstance(videos, dict):
+                    for entry in videos.values():
+                        if not isinstance(entry, dict):
+                            continue
+                        allowed = entry.get('allowed_users', '')
+                        if isinstance(allowed, str):
+                            entry['allowed_users'] = ', '.join(
+                                name.strip() for name in allowed.split(',')
+                                if name.strip() and name.strip() != target
+                            )
+                    save_json(VIDEOS_FILE, videos)
+
+                old_profile_pic = users[target].get('profile_pic', '') if isinstance(users[target], dict) else ''
+                revoke_all_user_sessions(target)
+                online_users.pop(target, None)
+                user_status.pop(target, None)
+                if target in live_streams:
+                    live_streams.pop(target, None)
+                    stream_viewers.pop(target, None)
+                    socketio.emit('stream_ended', {'broadcaster': target}, broadcast=True)
+                if old_profile_pic:
+                    still_used = any(isinstance(data, dict) and data.get('profile_pic') == old_profile_pic
+                                     for name, data in users.items() if name != target)
+                    if not still_used:
+                        remove_local_media(PROFILE_DIR, old_profile_pic)
+                del users[target]
+                save_json(USERS_FILE, users)
+                return redirect(url_for('admin_dashboard', msg=f'User {target} deleted', msg_type='success'))
         return redirect(url_for('admin_dashboard'))
 
     metrics = [{'user': user, 'total_mins': sum(h.get('duration', 0) for h in history) // 60, 'history': ', '.join([videos.get(h.get('video_id'), {}).get('title', 'Unknown')[:20] for h in history[-5:]]) or 'No history'} for user, history in history_db.items()]
@@ -847,7 +1298,7 @@ def live_watch(broadcaster):
 @login_required
 @limiter.limit('1000 per hour')
 def track_engagement():
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     vid = data.get('video_id')
     videos = load_json(VIDEOS_FILE)
     if not isinstance(vid, str) or vid not in videos:
@@ -869,7 +1320,7 @@ def track_engagement():
 @app.route('/api/like_comment', methods=['POST'])
 @login_required
 def like_comment():
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     video_id = data.get('video_id')
     comment_id = data.get('comment_id')
     videos = load_json(VIDEOS_FILE)
@@ -882,11 +1333,26 @@ def like_comment():
     comments_db = load_json(COMMENTS_FILE)
     comments = comments_db.get(video_id, [])
     def find_and_like(comment_list):
-        for c in comment_list:
-            if c['id'] == comment_id: likes = c.get('likes', []); (likes.remove(session['username']) if session['username'] in likes else likes.append(session['username'])); c['likes'] = likes; return len(likes)
-            if 'replies' in c:
-                res = find_and_like(c['replies'])
-                if res is not None: return res
+        if not isinstance(comment_list, list):
+            return None
+        for comment in comment_list:
+            if not isinstance(comment, dict):
+                continue
+            if comment.get('id') == comment_id:
+                likes = comment.get('likes', [])
+                if not isinstance(likes, list):
+                    likes = []
+                if session['username'] in likes:
+                    likes.remove(session['username'])
+                else:
+                    likes.append(session['username'])
+                comment['likes'] = likes
+                return len(likes)
+            replies = comment.get('replies')
+            if isinstance(replies, list):
+                result = find_and_like(replies)
+                if result is not None:
+                    return result
         return None
     likes_count = find_and_like(comments)
     if likes_count is not None: comments_db[video_id] = comments; save_json(COMMENTS_FILE, comments_db); return jsonify({'status': 'ok', 'likes': likes_count})
@@ -895,7 +1361,7 @@ def like_comment():
 @app.route('/api/save_video', methods=['POST'])
 @login_required
 def save_video():
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     vid = data.get('video_id')
     videos = load_json(VIDEOS_FILE)
     if not isinstance(vid, str) or vid not in videos:
@@ -918,7 +1384,7 @@ def save_video():
 @app.route('/api/watch_history', methods=['POST'])
 @login_required
 def api_watch_history():
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     vid = data.get('video_id')
     videos = load_json(VIDEOS_FILE)
     if not isinstance(vid, str) or vid not in videos:
@@ -940,7 +1406,7 @@ def api_playlists():
     playlists_db = load_json(PLAYLISTS_FILE)
     user = session['username']
     if request.method == 'POST':
-        data = request.get_json(silent=True) or {}
+        data = request_json_object()
         name = data.get('name', '')
         name = name.strip()[:100] if isinstance(name, str) else ''
         if not name:
@@ -956,7 +1422,7 @@ def api_playlists():
 @login_required
 def api_add_to_playlist(pl_id):
     playlists_db = load_json(PLAYLISTS_FILE)
-    data = request.get_json(silent=True) or {}
+    data = request_json_object()
     video_id = data.get('video_id')
     pl = playlists_db.get(pl_id)
     if not pl or pl.get('owner') != session['username']:
@@ -1015,10 +1481,12 @@ def handle_connect(): pass
 
 @socketio.on('register_user')
 def handle_register(data):
-    username = data.get('username')
-    if username and is_valid_username(username) and session.get('username') == username:
-        users = load_json(USERS_FILE)
-        if username in users: online_users[username] = request.sid; user_status[username] = 'Online'; emit('user_online', {'username': username}, broadcast=True)
+    data = data if isinstance(data, dict) else {}
+    username = authenticated_socket_username()
+    if username and data.get('username') == username:
+        online_users[username] = request.sid
+        user_status[username] = 'Online'
+        emit('user_online', {'username': username}, broadcast=True)
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -1042,19 +1510,24 @@ def handle_disconnect():
 
 @socketio.on('start_live_stream')
 def handle_start_stream(data):
-    username = session.get('username')
+    username = authenticated_socket_username()
     data = data if isinstance(data, dict) else {}
-    users = load_json(USERS_FILE)
-    sessions = load_json(SESSIONS_FILE)
-    sid = session.get('session_id')
-    if username and is_valid_username(username) and username in users and sid in sessions:
-        live_streams[username] = {'title': str(data.get('title', 'Untitled Stream'))[:100], 'sid': request.sid}
+    if username:
+        # Replacing an existing broadcaster socket must notify viewers rather than
+        # leaving them attached to a dead peer connection.
+        if username in live_streams:
+            live_streams.pop(username, None)
+            stream_viewers.pop(username, None)
+            socketio.emit('stream_ended', {'broadcaster': username}, broadcast=True)
+        title = data.get('title', 'Untitled Stream')
+        title = title.strip()[:100] if isinstance(title, str) else 'Untitled Stream'
+        live_streams[username] = {'title': title or 'Untitled Stream', 'sid': request.sid}
         stream_viewers[username] = set()
         emit('stream_started', {'broadcaster': username}, broadcast=True)
 
 @socketio.on('stop_live_stream')
 def handle_stop_stream():
-    username = session.get('username')
+    username = authenticated_socket_username()
     stream = live_streams.get(username) if username else None
     if stream and stream.get('sid') == request.sid:
         del live_streams[username]
@@ -1064,9 +1537,8 @@ def handle_stop_stream():
 @socketio.on('join_live_stream')
 def handle_join_stream(data):
     data = data if isinstance(data, dict) else {}
-    username = session.get('username')
-    sessions = load_json(SESSIONS_FILE)
-    if not username or session.get('session_id') not in sessions:
+    username = authenticated_socket_username()
+    if not username:
         return
     broadcaster = data.get('broadcaster')
     stream = live_streams.get(broadcaster) if isinstance(broadcaster, str) else None
@@ -1076,7 +1548,7 @@ def handle_join_stream(data):
 
 @socketio.on('webrtc_signal')
 def handle_webrtc(data):
-    if not isinstance(data, dict) or session.get('session_id') not in load_json(SESSIONS_FILE):
+    if not isinstance(data, dict) or not authenticated_socket_username():
         return
     target_sid = data.get('target_sid')
     if not isinstance(target_sid, str):
@@ -1113,6 +1585,13 @@ templates = {
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
     <meta name="csrf-token" content="{{ csrf_token() }}">
     <meta name="theme-color" content="#ffffff" id="theme-color-meta">
+    <meta name="application-name" content="FamTube">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+    <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
     <title>FamTube</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.1/socket.io.js"></script>
     <script>
@@ -1195,9 +1674,10 @@ templates = {
         .sidebar { position: fixed; top: 0; left: -300px; width: 280px; height: 100%; background: var(--surface); border-right: 1px solid var(--border); z-index: 1002; transition: left 0.3s ease; overflow-y: auto; padding-bottom: 20px; }
         .sidebar.open { left: 0; }
         .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-        .sidebar-links a { display: flex; align-items: center; gap: 24px; padding: 12px 24px; color: var(--text); text-decoration: none; font-size: 15px; font-weight: 500; }
-        .sidebar-links a:hover { background: var(--hover); }
-        .sidebar-links a span.icon { font-size: 22px; width: 24px; text-align: center; }
+        .sidebar-links a, .sidebar-links .logout-link { display: flex; align-items: center; gap: 24px; padding: 12px 24px; color: var(--text); text-decoration: none; font-size: 15px; font-weight: 500; }
+        .sidebar-links a:hover, .sidebar-links .logout-link:hover { background: var(--hover); }
+        .sidebar-links a span.icon, .sidebar-links .logout-link span.icon { font-size: 22px; width: 24px; text-align: center; }
+        .sidebar-links .logout-link { width: 100%; border: 0; background: transparent; cursor: pointer; font-family: inherit; line-height: inherit; text-align: left; }
 
         /* Video Grid & Cards (YouTube Style) */
         .grid { display: grid; grid-template-columns: 1fr; gap: 24px; }
@@ -1302,9 +1782,9 @@ templates = {
                 box-shadow: none;
             }
             .sidebar-header { display: none; }
-            .sidebar-links a { gap: 20px; padding: 11px 14px; margin: 2px 0; border-radius: 10px; }
-            .sidebar-links a:hover { background: var(--hover); }
-            .sidebar-links a:active, .sidebar-links a.active { background: var(--hover); font-weight: 600; }
+            .sidebar-links a, .sidebar-links .logout-link { gap: 20px; padding: 11px 14px; margin: 2px 0; border-radius: 10px; }
+            .sidebar-links a:hover, .sidebar-links .logout-link:hover { background: var(--hover); }
+            .sidebar-links a:active, .sidebar-links a.active, .sidebar-links .logout-link:active { background: var(--hover); font-weight: 600; }
             body.authenticated .container { max-width: none; width: calc(100% - 240px); margin: 0 0 0 240px; padding: 24px clamp(20px, 2.5vw, 42px) 36px; }
             body.authenticated.sidebar-collapsed .sidebar { left: -260px; }
             body.authenticated.sidebar-collapsed .container { width: 100%; margin-left: 0; }
@@ -1360,7 +1840,7 @@ templates = {
             .tabs { padding-inline: 12px; }
             body.nav-open { overflow: hidden; }
             .sidebar { width: min(300px, 86vw); padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
-            .sidebar-links a { min-height: 46px; }
+            .sidebar-links a, .sidebar-links .logout-link { min-height: 46px; }
             table { min-width: 560px; }
             .table-scroll, [style*="overflow-x:auto"] { max-width: 100%; }
             .watch-player-shell + div, .watch-player-shell ~ .admin-panel { margin-inline: 12px; }
@@ -1412,7 +1892,10 @@ templates = {
             <div style="height:1px;background:var(--border);margin:8px 0;"></div>
             <a href="/settings" {% if request.endpoint == 'settings' %}class="active"{% endif %}><span class="icon">⚙️</span> Settings</a>
             {% if session.role == 'admin' %}<a href="/famtube_admin" {% if request.endpoint in ['admin_dashboard', 'admin_user_history'] %}class="active"{% endif %}><span class="icon">🛡️</span> Admin</a>{% endif %}
-            <a href="/logout"><span class="icon">🚪</span> Logout</a>
+            <form method="POST" action="/logout" style="margin:0;">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="logout-link"><span class="icon">🚪</span> Logout</button>
+            </form>
         </div>
     </div>
 
@@ -1458,7 +1941,7 @@ templates = {
 {% if session.username %}
 <script>
     const socket = io();
-    socket.on('connect', () => { socket.emit('register_user', {username: '{{ session.username }}'}); });
+    socket.on('connect', () => { socket.emit('register_user', {username: {{ session.username | tojson }}}); });
     socket.on('receive_notification', (data) => {
         let badge = document.getElementById('notif-badge');
         if(badge) { badge.style.display = 'flex'; badge.innerText = parseInt(badge.innerText || 0) + 1; }
@@ -1540,6 +2023,16 @@ templates = {
             document.body.classList.remove('nav-open');
         }
     });
+</script>
+<script>
+    // Service workers require a secure context. HTTP remains usable on a trusted
+    // home LAN, but browsers will deliberately skip PWA worker registration there.
+    if (window.isSecureContext && 'serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/service-worker.js', { scope: '/' })
+                .catch((error) => console.warn('FamTube offline support could not be enabled:', error));
+        });
+    }
 </script>
 </body>
 </html>
@@ -1734,7 +2227,7 @@ document.getElementById('uploadForm').addEventListener('submit', function() {
     <div class="admin-panel" style="max-width:400px;width:90%;margin:0;"> <h3 style="margin-bottom:16px;">Add to Playlist</h3> <div id="playlistList"></div> <input type="text" id="newPlaylistName" placeholder="New playlist name" style="margin:12px 0;"> <button onclick="createPlaylist()" class="primary-btn">Create</button> <button onclick="closeModal()" style="margin-left:8px;background:#888;" class="primary-btn">Cancel</button> </div>
 </div>
 <script>
-const videoId = '{{ video_id }}'; const csrfToken = document.querySelector('meta[name="csrf-token"]').content; let watchInterval, isMusicMode = false; const vp = document.getElementById('videoPlayer'); const ap = new Audio('/media/{{ video.filename }}');
+const videoId = {{ video_id | tojson }}; const csrfToken = document.querySelector('meta[name="csrf-token"]').content; let watchInterval, isMusicMode = false; const vp = document.getElementById('videoPlayer'); const ap = new Audio({{ url_for('serve_media', filename=video.filename) | tojson }});
 function startTracking() {
     stopTracking();
     watchInterval = setInterval(() => {
@@ -1746,7 +2239,7 @@ vp.onplay = () => { startTracking(); fetch('/api/watch_history', {method: 'POST'
 function toggleMusicMode() { isMusicMode = !isMusicMode; const btn = document.getElementById('musicModeToggle'); if(isMusicMode) { ap.currentTime = vp.currentTime; vp.pause(); vp.style.display = 'none'; ap.style.display = 'block'; ap.play(); btn.innerText = "🎧 Video"; } else { vp.currentTime = ap.currentTime; ap.pause(); ap.style.display = 'none'; vp.style.display = 'block'; vp.play(); btn.innerText = "🎧 Music"; } }
 function saveVideo() { fetch('/api/save_video', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId})}).then(r => r.json()).then(() => location.reload()); }
 function likeComment(cid) { fetch('/api/like_comment', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId, comment_id: cid})}).then(r => r.json()).then(data => { if(data.likes !== undefined) document.getElementById('like-' + cid).innerText = data.likes; }); }
-function addToPlaylist() { fetch('/api/playlists').then(r => r.json()).then(data => { const list = document.getElementById('playlistList'); list.innerHTML = ''; data.playlists.forEach(pl => { const div = document.createElement('div'); div.innerHTML = `<div style="padding:12px;cursor:pointer;border-bottom:1px solid var(--border);">${pl.name} (${pl.video_count})</div>`; div.onclick = () => addVideoToPlaylist(pl.id); list.appendChild(div); }); document.getElementById('playlistModal').style.display = 'flex'; }); }
+function addToPlaylist() { fetch('/api/playlists').then(r => { if (!r.ok) throw new Error('Could not load playlists'); return r.json(); }).then(data => { const list = document.getElementById('playlistList'); list.replaceChildren(); (Array.isArray(data.playlists) ? data.playlists : []).forEach(pl => { const row = document.createElement('div'); row.style.cssText = 'padding:12px;cursor:pointer;border-bottom:1px solid var(--border);'; row.textContent = `${String(pl.name ?? 'Untitled')} (${Number(pl.video_count) || 0})`; row.addEventListener('click', () => addVideoToPlaylist(String(pl.id))); list.appendChild(row); }); document.getElementById('playlistModal').style.display = 'flex'; }).catch(() => alert('Could not load playlists. Please try again.')); }
 function addVideoToPlaylist(plId) { fetch(`/api/playlists/${plId}/videos`, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({video_id: videoId})}).then(r => r.json()).then(() => { alert('Added!'); closeModal(); }); }
 function createPlaylist() { const name = document.getElementById('newPlaylistName').value.trim(); if(!name) return; fetch('/api/playlists', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken}, body: JSON.stringify({name: name})}).then(r => r.json()).then(data => { if(data.id) addVideoToPlaylist(data.id); }); }
 function closeModal() { document.getElementById('playlistModal').style.display = 'none'; }
@@ -1967,7 +2460,7 @@ liveSocket.on('force_stream_end', () => { document.getElementById('stopBtn').cli
     </div>
 </div>
 <script>
-const watchSocket = io(); const broadcaster = '{{ broadcaster }}'; let pc = null, broadcasterSid = null; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
+const watchSocket = io(); const broadcaster = {{ broadcaster | tojson }}; let pc = null, broadcasterSid = null; const rtcConfig = {iceServers: [{urls: 'stun:stun.l.google.com:19302'}]};
 if(!window.isSecureContext && location.protocol !== 'https:') { document.getElementById('statusText').innerText = 'Connection blocked: insecure context. Use HTTPS.'; } else {
     watchSocket.on('connect', () => { watchSocket.emit('join_live_stream', {broadcaster: broadcaster}); });
     watchSocket.on('stream_ended', (data) => {
@@ -1992,5 +2485,7 @@ if(!window.isSecureContext && location.protocol !== 'https:') { document.getElem
 app.jinja_loader = DictLoader(templates)
 
 if __name__ == '__main__':
-    threading.Thread(target=generate_missing_thumbnails, daemon=True).start()
+    # Finish thumbnail backfill before accepting requests so it cannot overwrite newer
+    # videos.json data from a concurrent upload. Generation failures are non-fatal.
+    generate_missing_thumbnails()
     socketio.run(app, debug=False, use_reloader=False, host='0.0.0.0', port=5000)
