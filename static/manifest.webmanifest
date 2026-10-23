@@ -1,0 +1,29 @@
+{
+  "id": "/",
+  "name": "FamTube",
+  "short_name": "FamTube",
+  "description": "Private, family-friendly video sharing on your own server.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0f0f0f",
+  "theme_color": "#ffffff",
+  "categories": ["entertainment", "social"],
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "/static/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
