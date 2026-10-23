@@ -1,29 +1,24 @@
 # FamTube - Family Video Sharing Platform
-# Python Dependencies
+# Python 3.10+ required by current security/dependency floors.
+# Minimum versions avoid silently accepting very old framework releases.
 
 # Core Web Framework
-Flask>=2.3.0
+Flask>=3.1.3
 
 # Security & Rate Limiting
-Flask-Talisman>=1.0.0
-Flask-Limiter>=3.5.0
-Flask-WTF>=1.1.0
+Flask-Talisman>=1.1.0
+Flask-Limiter>=4.1.1
+Flask-WTF>=1.3.0
 
 # Real-time Features (Live Streaming, Notifications)
-Flask-SocketIO>=5.3.0
-python-socketio>=5.8.0
+Flask-SocketIO>=5.7.0
+python-socketio>=5.17.0
+python-engineio>=4.14.0
 
-# Async Support for SocketIO (Recommended for production)
-# Choose one: eventlet (easier setup) or gevent (higher performance)
-eventlet>=0.33.0
-# gevent>=23.9.0
-# gevent-websocket>=0.10.1
+# WebSocket transport for Flask-SocketIO's explicit threading mode
+simple-websocket>=1.1.0
 
-# Werkzeug (included with Flask, but pinned for security)
-Werkzeug>=2.3.0
-
-# Jinja2 (included with Flask, used for DictLoader)
-Jinja2>=3.1.0
-
-# Additional Utilities
-python-engineio>=4.5.0
+# Werkzeug and Jinja2 are Flask dependencies, but explicit minimums prevent
+# older installed copies from satisfying this application's requirements.
+Werkzeug>=3.1.9
+Jinja2>=3.1.6
